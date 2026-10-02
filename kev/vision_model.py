@@ -156,9 +156,6 @@ class VisionDecisionModel(nn.Module):
     hybrid  = True        # always row form; blocks packed mask path
     graphs  = None
     option_isolation = False
-    # class-level placeholders so hasattr() checks pass before instantiation
-    head   = None
-    device = None
 
     def __init__(self, name: str, tok, device, lora=None, revision=None,
                  head_dim=256, lora_targets="all", dtype=torch.float32,
@@ -452,6 +449,8 @@ class VisionDecisionModel(nn.Module):
         return [p for p in self.parameters() if p.requires_grad]
 
 
-# Verify the scoring interface is fully satisfied
-assert all(hasattr(VisionDecisionModel, m) for m in SCORING_INTERFACE), \
-    f"missing SCORING_INTERFACE methods: {[m for m in SCORING_INTERFACE if not hasattr(VisionDecisionModel, m)]}"
+# Verify the scoring interface is fully satisfied (instance attributes head/device
+# are set in __init__ and cannot be checked at class level; skip them here)
+_INSTANCE_ATTRS = {"head", "device"}
+assert all(hasattr(VisionDecisionModel, m) for m in SCORING_INTERFACE if m not in _INSTANCE_ATTRS), \
+    f"missing SCORING_INTERFACE methods: {[m for m in SCORING_INTERFACE if m not in _INSTANCE_ATTRS and not hasattr(VisionDecisionModel, m)]}"

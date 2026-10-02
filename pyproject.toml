@@ -25,7 +25,9 @@ dependencies = [
     "peft>=0.21",
     "pydantic>=2.9",
     "scikit-learn>=1.9.1",
+    "Pillow>=10.0",
     "torch>=2.6,<2.9",
+    "torchvision>=0.21,<0.24",
     "transformers>=5.17,<6",
 ]
 

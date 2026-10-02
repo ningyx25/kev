@@ -386,6 +386,105 @@ def load_records(path, source="custom"):
     return records
 
 
+def load_vision_records(path, images_root=None, source="custom"):
+    """Labelled requests from an ac-jev-style JSONL file where each record carries a single
+    `question` (not `questions`) and an `image` path, plus a `target` soft-label list.
+
+    Each record is converted to the standard labelled-request shape (compatible with
+    materialize() and load_records()), with:
+      - `questions`: {qid: {type, instructions, criteria, label, src, target}}
+        qid is taken from the record's `id` field (last `::`-separated segment).
+        `target` is a dict keyed by the criteria keys (choice), ["false","true"] (noul),
+        or level-index strings (score), matching the same convention as materialize().
+        `label` is the argmax of the soft-target list; hard-label fallback when no `target`.
+      - `_meta["image_path"]`: resolved absolute path to the image file.
+
+    `images_root` is prepended to relative `image` paths; defaults to the directory
+    that contains `path`.
+    """
+    path = Path(path)
+    if images_root is None:
+        images_root = path.parent
+    images_root = Path(images_root)
+    records = []
+    with path.open(encoding="utf-8") as f:
+        for n, line in enumerate(f):
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if "state" not in r:
+                raise ValueError(f"{path}:{n + 1}: record has no 'state'")
+            q = r.get("question")
+            if not isinstance(q, dict) or "type" not in q:
+                raise ValueError(f"{path}:{n + 1}: record has no valid 'question'")
+            if "criteria" not in q:
+                raise ValueError(f"{path}:{n + 1}: question has no 'criteria'")
+            # derive the option keys in the same order as the criteria / question type
+            if q["type"] == "choice":
+                keys = list(q["criteria"])
+            elif q["type"] == "noul":
+                keys = ["false", "true"]
+            else:   # score
+                keys = [str(i) for i in range(len(q["criteria"]))]
+            # resolve soft target: list[float] -> dict keyed by option keys
+            target_list = r.get("target")
+            if target_list is not None:
+                if len(target_list) != len(keys):
+                    raise ValueError(
+                        f"{path}:{n + 1}: target length {len(target_list)} != "
+                        f"criteria length {len(keys)}"
+                    )
+                label_idx = max(range(len(target_list)), key=lambda i: target_list[i])
+                label = keys[label_idx]
+                target_dict = {k: float(v) for k, v in zip(keys, target_list)}
+            else:
+                if "label" not in q:
+                    raise ValueError(f"{path}:{n + 1}: question has no 'target' or 'label'")
+                label = q["label"]
+                target_dict = None
+            # use the last colon-separated segment of the record id as the question id
+            rec_id = r.get("id", f"{source}/{n}")
+            qid = rec_id.split(":")[-1]
+            question_entry = {
+                "type": q["type"],
+                "instructions": q.get("instructions"),
+                "criteria": q["criteria"],
+                "label": label,
+                "src": f"{source}_{q['type']}",
+            }
+            if target_dict is not None:
+                question_entry["target"] = target_dict
+            # resolve image path to absolute (images_root / relative, or as-is if absolute)
+            img_path = r.get("image")
+            if img_path is not None:
+                img_abs = Path(img_path)
+                if not img_abs.is_absolute():
+                    img_abs = images_root / img_path
+                img_path = str(img_abs)
+            text = json.dumps(r["state"], sort_keys=True, ensure_ascii=False) if not isinstance(r["state"], str) else r["state"]
+            rec = {
+                "state": r["state"],
+                "questions": {qid: question_entry},
+                "_meta": {
+                    **r.get("_meta", {}),
+                    "source": source,
+                    "variant": "clean",
+                    "id": rec_id,
+                    "group_id": r.get("group", rec_id),
+                    "row": n,
+                    "split": r.get("split", "custom"),
+                    "dataset": r.get("dataset", source),
+                    "text_sha256": hashlib.sha256(" ".join(text.casefold().split()).encode()).hexdigest(),
+                },
+            }
+            if img_path is not None:
+                rec["_meta"]["image_path"] = img_path
+            records.append(rec)
+    if not records:
+        raise ValueError(f"{path}: no records")
+    return records
+
+
 def api_request(record):
     """The /v1/systemone request body for a labelled record: state and typed questions only, never labels, targets or
     metadata (this is what leaves the machine when a remote predictor is scored)."""

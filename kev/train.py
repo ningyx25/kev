@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from . import full_ft
 from .checkpoint import Checkpoint, Meta, write_meta
 from .device import allocated_bytes, default_device, empty_cache, sync
-from .data import EVAL_ONLY, build, augment, load_records, materialize, none_pair, source_seed
+from .data import EVAL_ONLY, build, augment, load_records, load_vision_records, materialize, none_pair, source_seed
 from .suite import SYNTHETIC_SOURCES, digest, load_split, read_json, read_manifest, validate_training, write_json
 from .model import MAX_STATE, MAX_TRAIN_STATE, DecisionModel, fits, load_tokenizer, rows_of, training_context, user_tokens
 
@@ -86,8 +86,15 @@ def accumulation_records(n, batch, accum, microbatch):
 def training_requests(a, tok, manifest, holdout):
     """The labelled requests one run trains on: the suite's training partition, records built from the public sources,
     or the user's own file (optionally with a replay sample from the suite); filtered to the training context, checked
-    against the eval-only policy, then the ablation knobs (--train_sources, --public_frac, --synthetic_repeat)."""
+    against the eval-only policy, then the ablation knobs (--train_sources, --public_frac, --synthetic_repeat).
+    With --vision_data: records are loaded from the ac-jev JSONL; the text-context filter is skipped (image tokens are
+    not counted by fits()) and the eval-only policy check is bypassed (the source is 'custom')."""
     # the suite's rules (declared trainable sources, no held-out structures) apply to every record taken from it
+    if a.vision_data:
+        images_root = a.images_root or None
+        reqs = load_vision_records(a.vision_data, images_root=images_root)
+        print(f"vision: {len(reqs)} records from {a.vision_data}", flush=True)
+        return reqs
     if a.data:
         reqs = load_records(a.data)
         if a.replay:
@@ -316,26 +323,43 @@ def plan_shapes(model, tok, a, reqs, epoch, pairs, state_tokens):
     return {id(r): [(state_tokens[id(r)], branches(v)) for v in record_variants(r, a, epoch, pairs)[0]] for r in reqs}
 
 
-def encode_batch(model, tok, a, chunk, epoch, pairs=None):
+def encode_batch(model, tok, a, chunk, epoch, pairs=None, vision_processor=None):
     """Each request's variants for this epoch (record_variants), optionally a permuted copy for the KL term, encoded
-    strictly."""
+    strictly.  Vision records (those with _meta["image_path"]) are encoded via encode_vision() when vision_processor
+    is given; otherwise they fall through to the plain text encode() path."""
     out, c = [], training_context(a.max_state)
     limits = {"max_state": c["max_state"], "max_branch": c["max_branch"]}
     for req in chunk:
         variants, item_rng = record_variants(req, a, epoch, pairs)
         for v in variants:
             rec = materialize(v)
-            enc = model.encode(tok, rec, strict=True, **limits)
+            img_path = req.get("_meta", {}).get("image_path")
+            if img_path and vision_processor is not None:
+                from .vision_model import encode_vision as _enc_vision
+                enc = _enc_vision(tok, rec, img_path, vision_processor, strict=True, **limits)
+            else:
+                enc = model.encode(tok, rec, strict=True, **limits)
             if len(enc["ids"]) > c["max_packed"]:
                 raise ValueError(f"training request exceeds {c['max_packed']} packed tokens")
             parts = question_parts(enc, a.row_budget, a.shared_prefix)
             for part in parts:   # one part unless --row_budget splits a record whose rows do not fit one pass
                 sub = rec if len(parts) == 1 else {**rec, "questions": [rec["questions"][q] for q in part]}
-                out.append(Variant(sub, enc if sub is rec else model.encode(tok, sub, strict=True, **limits), req["_meta"]["id"], req["_meta"]["source"],
+                if img_path and vision_processor is not None:
+                    from .vision_model import encode_vision as _enc_vision
+                    sub_enc = enc if sub is rec else _enc_vision(tok, sub, img_path, vision_processor, strict=True, **limits)
+                else:
+                    sub_enc = enc if sub is rec else model.encode(tok, sub, strict=True, **limits)
+                out.append(Variant(sub, sub_enc, req["_meta"]["id"], req["_meta"]["source"],
                                    share=len(part) / len(rec["questions"])))
         if a.perm_kl > 0 and item_rng.random() < a.perm_frac and any(q["qtype"] == "choice" and len(q["options"]) >= 3 for q in rec["questions"]):
             rec2, perms = permuted_copy(rec, item_rng)
-            out[-1].permuted = (model.encode(tok, rec2, strict=True, **limits), perms)
+            img_path = req.get("_meta", {}).get("image_path")
+            if img_path and vision_processor is not None:
+                from .vision_model import encode_vision as _enc_vision
+                enc2 = _enc_vision(tok, rec2, img_path, vision_processor, strict=True, **limits)
+            else:
+                enc2 = model.encode(tok, rec2, strict=True, **limits)
+            out[-1].permuted = (enc2, perms)
     return out
 
 
@@ -410,6 +434,9 @@ def parse_args():
     ap.add_argument("--anchor_sources", default="", help="comma-separated sources to anchor (default: every record with a target)")
     ap.add_argument("--out", default="runs/kev")
     ap.add_argument("--data", default="", help="your own labelled requests, one JSON object per line (see kev.data.load_records); an alternative to --suite for fine-tuning, or combined with --suite and --replay")
+    ap.add_argument("--vision_data", default="", help="ac-jev-style JSONL with a single `question` and `image` path per record (see kev.data.load_vision_records); enables vision training with VisionDecisionModel")
+    ap.add_argument("--vision_base", default="", help="local path to the Qwen3VL checkpoint used as the backbone when --vision_data is set (default: the value of --base)")
+    ap.add_argument("--images_root", default="", help="root directory that `image` paths in --vision_data are relative to (default: directory containing --vision_data); the ac-jev datasets use the dohnuts repo root")
     ap.add_argument("--max_state", type=int, default=MAX_STATE, help=f"state tokens per training record (default {MAX_STATE}); raising it admits long-state --data records, the packed limit grows by the same amount")
     ap.add_argument("--replay", type=int, default=0, help="with --data and --suite: mix in this many records sampled (by --seed) from the suite's training partition, so a delta fine-tune does not forget the released recipe")
     ap.add_argument("--init_from", default="", help="delta mode: warm-start LoRA and the pointer head from an existing run "
@@ -539,9 +566,19 @@ def main():
     anchor_sources = set(a.anchor_sources.split(",")) if a.anchor_sources else None
 
     tok = load_tokenizer(a.base, revision=revision)
-    model = DecisionModel(a.base, tok, dev, lora=None if a.full_ft else a.lora, revision=revision, head_dim=a.head_dim, lora_targets=a.lora_targets,
-                          option_isolation=bool(a.option_isolation), special_embeddings=bool(a.special_embeddings),
-                          dtype=torch.bfloat16 if a.weights_dtype == "bf16" else torch.float32, direct_load=bool(a.full_ft))
+    vision_processor = None
+    if a.vision_data:
+        from .vision_model import VisionDecisionModel, load_vision_processor
+        vision_base = a.vision_base or a.base
+        vision_processor = load_vision_processor(vision_base)
+        model = VisionDecisionModel(vision_base, tok, dev, lora=a.lora, head_dim=a.head_dim,
+                                    lora_targets=a.lora_targets,
+                                    dtype=torch.bfloat16 if a.weights_dtype == "bf16" else torch.float32,
+                                    processor=vision_processor)
+    else:
+        model = DecisionModel(a.base, tok, dev, lora=None if a.full_ft else a.lora, revision=revision, head_dim=a.head_dim, lora_targets=a.lora_targets,
+                              option_isolation=bool(a.option_isolation), special_embeddings=bool(a.special_embeddings),
+                              dtype=torch.bfloat16 if a.weights_dtype == "bf16" else torch.float32, direct_load=bool(a.full_ft))
     if a.checkpointing:
         model.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.lm.config.use_cache = False
@@ -617,7 +654,7 @@ def main():
                       f"the plan's largest pass {largest} of --pass_tokens_max {a.pass_tokens_max} padded tokens", flush=True)
         for mb in range(start_mb if ep == start_epoch else 0, len(plan)):
             chunk, step_records, ends_step = plan[mb]
-            batch = encode_batch(model, tok, a, chunk, ep, pairs)
+            batch = encode_batch(model, tok, a, chunk, ep, pairs, vision_processor=vision_processor)
             variants = sum(v.share for v in batch)   # a record split by --row_budget counts once
             # weight by source records in the accumulation group (over all ranks) so none-pair siblings do not inflate a record's share
             group_records = step_records * (variants / len(chunk))

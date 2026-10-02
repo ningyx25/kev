@@ -680,6 +680,8 @@ def main():
         for mb in range(start_mb if ep == start_epoch else 0, len(plan)):
             chunk, step_records, ends_step = plan[mb]
             batch = encode_batch(model, tok, a, chunk, ep, pairs, vision_processor=vision_processor)
+            if not rank:
+                print(f"\r  ep{ep} mb {mb+1}/{len(plan)} step {step}", end="", flush=True)
             variants = sum(v.share for v in batch)   # a record split by --row_budget counts once
             # weight by source records in the accumulation group (over all ranks) so none-pair siblings do not inflate a record's share
             group_records = step_records * (variants / len(chunk))
@@ -697,7 +699,7 @@ def main():
                 sched.step(); opt.zero_grad(); step += 1
                 step_seconds.append(round(time.time() - last, 3)); last = time.time()
                 if dev == "mps": empty_cache(dev)   # MPS only: per-step cache release keeps the unified-memory footprint down; on CUDA it would just slow the step
-                if step % a.log_every == 0:
+                if step == 1 or step % a.log_every == 0:
                     loss_val  = run['ce'] / run['n']
                     kl_val    = run['kl'] / max(run['kl_n'], 1)
                     anch_val  = run['anchor'] / max(run['anchor_n'], 1)

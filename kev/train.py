@@ -566,7 +566,7 @@ def main():
     if a.anchor: print(f"anchor targets: {len(anchors)} records from {a.anchor}", flush=True)
     anchor_sources = set(a.anchor_sources.split(",")) if a.anchor_sources else None
 
-    tok = load_tokenizer(a.base, revision=revision)
+    tok = load_tokenizer(a.vision_base or a.base if a.vision_data else a.base, revision=revision)
     vision_processor = None
     if a.vision_data:
         from .vision_model import VisionDecisionModel, load_vision_processor

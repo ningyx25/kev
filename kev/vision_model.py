@@ -54,13 +54,15 @@ _MERGE_SIZE = 2
 
 
 def load_vision_processor(base: str):
-    """Load Qwen2VLImageProcessorFast from a local checkpoint directory.
+    """Load the image processor for a Qwen VL checkpoint from a local directory.
+    Uses Qwen2VLImageProcessor directly to avoid the transformers alias warning
+    about Qwen2VLImageProcessorFast being redirected.
     Requires torchvision (listed in pyproject.toml under dependencies).
     """
-    from transformers.models.qwen2_vl.image_processing_qwen2_vl_fast import (
-        Qwen2VLImageProcessorFast,
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
+        Qwen2VLImageProcessor,
     )
-    return Qwen2VLImageProcessorFast.from_pretrained(base, local_files_only=True)
+    return Qwen2VLImageProcessor.from_pretrained(base, local_files_only=True)
 
 
 def _image_token_count(image_grid_thw: torch.Tensor) -> int:

@@ -171,12 +171,18 @@ def init_distributed(device):
 def shard(model):
     """FSDP2 over the backbone: one unit per decoder layer plus the root (embeddings, final norm). Gradients are summed
     over ranks, not averaged (the trainer already divides each micro-batch's loss by the step's global record count). The
-    pointer head stays replicated (MasterAdamW sums its gradient), starting from rank 0's initialisation."""
+    pointer head stays replicated (MasterAdamW sums its gradient), starting from rank 0's initialisation.
+
+    VisionDecisionModel: also shards the visual encoder's blocks and the visual root, inner-first so FSDP2 can compose
+    the outer module over already-sharded children."""
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
     mesh = init_device_mesh(str(model.device).split(":")[0], (dist.get_world_size(),))
     policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-    units = [*model.lm.layers, model.lm]
+    # vision encoder blocks must be sharded before the visual root, which in turn before the text layers and lm root
+    visual = getattr(model.lm, "visual", None)
+    vis_units = ([*visual.blocks, visual] if visual is not None and hasattr(visual, "blocks") else [])
+    units = [*vis_units, *model.lm.layers, model.lm]
     for unit in units: fully_shard(unit, mesh=mesh, mp_policy=policy)
     for unit in units: unit.set_gradient_divide_factor(1.0)
     for t in model.head.parameters(): dist.broadcast(t.data, 0)

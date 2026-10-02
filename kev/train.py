@@ -550,7 +550,8 @@ def pinned_revision(a, manifest):
 def main():
     a = parse_args()
     dev = a.device or default_device()
-    rank, world = full_ft.init_distributed(dev) if a.full_ft else (0, 1)   # torchrun: each rank's "cuda" is its own GPU
+    # init_distributed for full-weight training (text or vision)
+    rank, world = full_ft.init_distributed(dev) if a.full_ft else (0, 1)
     out_dir = Path(a.out)
     if rank: sys.stdout = open(os.devnull, "w", encoding="utf-8")   # one log: rank 0's (errors still reach stderr)
     else: out_dir.mkdir(parents=True, exist_ok=bool(a.resume))
@@ -571,9 +572,12 @@ def main():
         from .vision_model import VisionDecisionModel, load_vision_processor
         vision_base = a.vision_base or a.base
         vision_processor = load_vision_processor(vision_base)
-        model = VisionDecisionModel(vision_base, tok, dev, lora=a.lora, head_dim=a.head_dim,
+        model = VisionDecisionModel(vision_base, tok, dev,
+                                    lora=None if a.full_ft else a.lora,
+                                    head_dim=a.head_dim,
                                     lora_targets=a.lora_targets,
                                     dtype=torch.bfloat16 if a.weights_dtype == "bf16" else torch.float32,
+                                    direct_load=bool(a.full_ft),
                                     processor=vision_processor)
     else:
         model = DecisionModel(a.base, tok, dev, lora=None if a.full_ft else a.lora, revision=revision, head_dim=a.head_dim, lora_targets=a.lora_targets,

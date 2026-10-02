@@ -162,12 +162,15 @@ class VisionDecisionModel(nn.Module):
 
     def __init__(self, name: str, tok, device, lora=None, revision=None,
                  head_dim=256, lora_targets="all", dtype=torch.float32,
-                 weights=None, processor=None):
+                 weights=None, processor=None, direct_load=False):
         """
-        name     – local path or Hub id of the Qwen3VL checkpoint
-        tok      – tokenizer (from load_tokenizer(name))
-        lora     – LoRA rank, or None for no adapter
-        weights  – full-weight checkpoint directory (overrides base backbone)
+        name        – local path or Hub id of the Qwen3VL checkpoint
+        tok         – tokenizer (from load_tokenizer(name))
+        lora        – LoRA rank, or None for full-weight training
+        direct_load – load directly onto `device` (like DecisionModel); needed for
+                      full-weight multi-GPU training so each rank loads only its own
+                      shard into device memory instead of staging the whole model
+        weights     – full-weight checkpoint directory (overrides base backbone)
         """
         super().__init__()
         from transformers.models.qwen3_vl.modeling_qwen3_vl import (
@@ -177,6 +180,8 @@ class VisionDecisionModel(nn.Module):
         attn  = "eager"   # sdpa on CUDA is fine too but eager is always safe
         load_kw = {"torch_dtype": dtype, "attn_implementation": attn,
                    "local_files_only": True}
+        if direct_load:
+            load_kw["device_map"] = {"": torch.cuda.current_device() if device == "cuda" else device}
         src = weights if weights else name
         vl_model = Qwen3VLForConditionalGeneration.from_pretrained(src, **load_kw)
         # .model is Qwen3VLModel — exposes the full VL forward (vision + text)

@@ -553,6 +553,28 @@ def pinned_revision(a, manifest):
     return revision
 
 
+def _fmt_dur(secs: float) -> str:
+    """Format a duration in seconds as h:mm, m:ss, or Xs."""
+    if secs < 0 or not math.isfinite(secs): return "?"
+    s = int(secs); h, m = s // 3600, (s % 3600) // 60
+    if h:  return f"{h}h{m:02d}m"
+    if m:  return f"{m}m{s % 60:02d}s"
+    return f"{s}s"
+
+
+def _progress_line(ep: int, mb: int, n_mb: int, step: int, steps: int,
+                   elapsed: float, step_seconds: list) -> str:
+    """Single overwrite-able progress line for the micro-batch heartbeat."""
+    frac   = step / max(steps, 1)
+    width  = 28
+    filled = int(width * frac)
+    bar    = "=" * filled + (">" if filled < width else "") + " " * max(0, width - filled - 1)
+    recent = step_seconds[-20:]
+    eta    = _fmt_dur((sum(recent) / len(recent)) * (steps - step)) if recent and step else "?"
+    return (f"\rep{ep} [{bar}] step {step}/{steps}  mb {mb}/{n_mb}  "
+            f"elapsed {_fmt_dur(elapsed)}  eta {eta}   ")
+
+
 def main():
     a = parse_args()
     dev = a.device or default_device()
@@ -681,7 +703,8 @@ def main():
             chunk, step_records, ends_step = plan[mb]
             batch = encode_batch(model, tok, a, chunk, ep, pairs, vision_processor=vision_processor)
             if not rank:
-                print(f"\r  ep{ep} mb {mb+1}/{len(plan)} step {step}", end="", flush=True)
+                print(_progress_line(ep, mb + 1, len(plan), step, steps,
+                                     time.time() - t0, step_seconds), end="", flush=True)
             variants = sum(v.share for v in batch)   # a record split by --row_budget counts once
             # weight by source records in the accumulation group (over all ranks) so none-pair siblings do not inflate a record's share
             group_records = step_records * (variants / len(chunk))
@@ -700,6 +723,7 @@ def main():
                 step_seconds.append(round(time.time() - last, 3)); last = time.time()
                 if dev == "mps": empty_cache(dev)   # MPS only: per-step cache release keeps the unified-memory footprint down; on CUDA it would just slow the step
                 if step == 1 or step % a.log_every == 0:
+                    if not rank: print(flush=True)   # newline after the overwrite-able progress bar
                     loss_val  = run['ce'] / run['n']
                     kl_val    = run['kl'] / max(run['kl_n'], 1)
                     anch_val  = run['anchor'] / max(run['anchor_n'], 1)

@@ -173,19 +173,38 @@ class VisionDecisionModel(nn.Module):
         weights     – full-weight checkpoint directory (overrides base backbone)
         """
         super().__init__()
-        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-            Qwen3VLForConditionalGeneration,
-        )
+        from transformers import AutoConfig
 
-        attn  = "eager"   # sdpa on CUDA is fine too but eager is always safe
+        attn  = "eager"
         load_kw = {"torch_dtype": dtype, "attn_implementation": attn,
                    "local_files_only": True}
         if direct_load:
             load_kw["device_map"] = {"": torch.cuda.current_device() if device == "cuda" else device}
         src = weights if weights else name
-        vl_model = Qwen3VLForConditionalGeneration.from_pretrained(src, **load_kw)
-        # .model is Qwen3VLModel — exposes the full VL forward (vision + text)
-        self.lm = vl_model.model
+
+        # Support both Qwen3VL (qwen3_vl) and Qwen3.5 VL (qwen3_5) architectures.
+        # Both expose the same VL forward() signature and compute_3d_position_ids.
+        cfg_model_type = AutoConfig.from_pretrained(src, local_files_only=True).model_type
+        if cfg_model_type == "qwen3_vl":
+            from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+                Qwen3VLForConditionalGeneration,
+            )
+            vl_model = Qwen3VLForConditionalGeneration.from_pretrained(src, **load_kw)
+            self.lm = vl_model.model          # Qwen3VLModel: text layers at .layers
+            hidden_size = self.lm.config.hidden_size
+        elif cfg_model_type == "qwen3_5":
+            from transformers.models.qwen3_5.modeling_qwen3_5 import (
+                Qwen3_5ForConditionalGeneration,
+            )
+            vl_model = Qwen3_5ForConditionalGeneration.from_pretrained(src, **load_kw)
+            self.lm = vl_model.model          # Qwen3_5Model: text layers at .language_model.layers
+            hidden_size = self.lm.config.text_config.hidden_size
+        else:
+            raise ValueError(
+                f"VisionDecisionModel: unsupported model_type {cfg_model_type!r}; "
+                "expected 'qwen3_vl' or 'qwen3_5'"
+            )
+        self._model_type = cfg_model_type
 
         self.pad_id = pad_id(tok)
         self._image_pad_id     = tok.convert_tokens_to_ids(_IMAGE_PAD_TOKEN)
@@ -205,7 +224,7 @@ class VisionDecisionModel(nn.Module):
                              target_modules=targets)
             self.lm = get_peft_model(self.lm, cfg)
 
-        self.head   = PointerHead(self.lm.config.hidden_size, dp=head_dim)
+        self.head   = PointerHead(hidden_size, dp=head_dim)
         self.device = device
         self.to(device)
 

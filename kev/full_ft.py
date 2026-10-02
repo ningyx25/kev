@@ -173,16 +173,19 @@ def shard(model):
     over ranks, not averaged (the trainer already divides each micro-batch's loss by the step's global record count). The
     pointer head stays replicated (MasterAdamW sums its gradient), starting from rank 0's initialisation.
 
-    VisionDecisionModel: also shards the visual encoder's blocks and the visual root, inner-first so FSDP2 can compose
-    the outer module over already-sharded children."""
+    VisionDecisionModel (qwen3_vl / qwen3_5): also shards the visual encoder blocks and the visual root, inner-first.
+    For qwen3_5 the text layers live at model.lm.language_model.layers; for qwen3_vl at model.lm.layers."""
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
     mesh = init_device_mesh(str(model.device).split(":")[0], (dist.get_world_size(),))
     policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-    # vision encoder blocks must be sharded before the visual root, which in turn before the text layers and lm root
+    # visual encoder blocks (VisionDecisionModel only); sharded first (innermost)
     visual = getattr(model.lm, "visual", None)
     vis_units = ([*visual.blocks, visual] if visual is not None and hasattr(visual, "blocks") else [])
-    units = [*vis_units, *model.lm.layers, model.lm]
+    # text layers: qwen3_5 keeps them under .language_model; qwen3_vl puts them directly on .lm
+    lm_root = getattr(model.lm, "language_model", model.lm)
+    text_units = [*lm_root.layers, model.lm]
+    units = [*vis_units, *text_units]
     for unit in units: fully_shard(unit, mesh=mesh, mp_policy=policy)
     for unit in units: unit.set_gradient_divide_factor(1.0)
     for t in model.head.parameters(): dist.broadcast(t.data, 0)

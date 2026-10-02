@@ -578,8 +578,8 @@ def _progress_line(ep: int, mb: int, n_mb: int, step: int, steps: int,
 def main():
     a = parse_args()
     dev = a.device or default_device()
-    # init_distributed for full-weight training (text or vision)
-    rank, world = full_ft.init_distributed(dev) if a.full_ft else (0, 1)
+    # init_distributed: full_ft uses FSDP2; LoRA uses DDP (replicated weights, data-parallel across ranks)
+    rank, world = full_ft.init_distributed(dev) if (a.full_ft or int(os.environ.get("WORLD_SIZE", "1")) > 1) else (0, 1)
     out_dir = Path(a.out)
     if rank: sys.stdout = open(os.devnull, "w", encoding="utf-8")   # one log: rank 0's (errors still reach stderr)
     else: out_dir.mkdir(parents=True, exist_ok=bool(a.resume))
@@ -628,7 +628,7 @@ def main():
         # one runs the packed mask (rows_form) unless a record is over ROW_PASS_TOKENS, whose cost it does not measure
         raise SystemExit("kev.train: --pass_tokens_max needs a hybrid backbone (Gated DeltaNet: every pass runs as rows or a shared "
                          f"prefix, which pass_tokens measures); {a.base} is attention-only and runs the packed mask")
-    if world > 1: full_ft.shard(model)
+    if world > 1 and a.full_ft: full_ft.shard(model)
     print(f"device={dev} world={world} trainable params={sum(p.numel() for p in model.trainable_parameters())/1e6:.1f}M", flush=True)
 
     reqs = training_requests(a, tok, manifest, holdout)
@@ -715,7 +715,9 @@ def main():
             run["n"] += variants; seen += round(variants); tokens_seen += sum(v.tokens for v in batch)
             peak_mem = max(peak_mem, allocated_bytes(dev))
             if ends_step:
-                if not a.full_ft: norm = float(torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), MAX_GRAD_NORM, error_if_nonfinite=True))   # MasterAdamW clips by the global norm itself; both refuse a non-finite norm (a NaN gradient from a finite loss)
+                if not a.full_ft:
+                    full_ft.allreduce_grads(model.trainable_parameters(), world)   # DDP: average grads before clip
+                    norm = float(torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), MAX_GRAD_NORM, error_if_nonfinite=True))
                 started = time.time(); opt.step(); sync(dev); optimizer_seconds += time.time() - started
                 grad_norms += [[] for _ in range(ep + 1 - len(grad_norms))]
                 grad_norms[ep].append(round(opt.grad_norm if a.full_ft else norm, 6))

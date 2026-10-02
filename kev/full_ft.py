@@ -217,6 +217,15 @@ def global_max(values):
     return top.tolist()
 
 
+def allreduce_grads(parameters, world: int):
+    """Average gradients across DDP ranks (LoRA / head-only: replicated weights, no FSDP sharding).
+    Call once per optimizer step, before clip_grad_norm_."""
+    if world <= 1 or not dist.is_initialized(): return
+    for p in parameters:
+        if p.grad is not None:
+            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+
 # --- resume points ----------------------------------------------------------------------------------------------------
 
 LATEST = "latest.json"   # the resume point to continue from; written last (atomically) by rank 0, after every rank's file

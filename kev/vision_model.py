@@ -76,11 +76,16 @@ def _image_token_count(image_grid_thw: torch.Tensor) -> int:
 
 def encode_vision(tok, rec, image_path: str, processor,
                   max_state=MAX_STATE, max_branch=MAX_BRANCH, strict=False,
-                  option_isolation=False):
+                  option_isolation=False, max_pixels=None):
     """Like kev.model.encode() but prepends a vision prefix to the state.
 
     The prefix is:  <|vision_start|>  <|image_pad|>×N  <|vision_end|>
     where N = _image_token_count(image_grid_thw).
+
+    max_pixels: if set, images larger than this (in total pixels) are
+    downscaled proportionally before processing, bounding the image token
+    count to max_pixels // (patch_size² × merge_size²).  A useful value
+    for training on 40-45 GB GPUs is 524_288 (→ ~512 image tokens).
 
     Additional keys in the returned dict:
       pixel_values   – [total_patches, C*t*h*w] float tensor (from the processor)
@@ -90,6 +95,11 @@ def encode_vision(tok, rec, image_path: str, processor,
     from PIL import Image
 
     img = Image.open(image_path).convert("RGB")
+    if max_pixels is not None and img.width * img.height > max_pixels:
+        scale = (max_pixels / (img.width * img.height)) ** 0.5
+        new_w = max(1, int(img.width * scale))
+        new_h = max(1, int(img.height * scale))
+        img = img.resize((new_w, new_h), Image.LANCZOS)
     proc_out = processor(images=[img], return_tensors="pt")
     pixel_values   = proc_out["pixel_values"]        # [total_patches, C*t*h*w]
     image_grid_thw = proc_out["image_grid_thw"]      # [1, 3]

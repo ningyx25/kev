@@ -49,6 +49,10 @@ mlx = [
 swanlab = [
     "swanlab>=0.4.0",
 ]
+vision-kernels = [
+    "causal-conv1d>=1.4.0",
+    "flash-linear-attention",
+]
 
 [dependency-groups]
 dev = [

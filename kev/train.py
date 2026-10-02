@@ -502,8 +502,8 @@ def parse_args():
                  "nor --anchor_w (a split record's parts would weight its anchored questions by their part's share of all its questions, "
                  "not 1 / anchored questions), nor under torchrun (FSDP2 ranks must run the same number of backward passes; sharded "
                  "ranks have the memory without it)")
-    if (a.save_every_steps or a.save_every_minutes or a.resume or a.stop_after) and not a.full_ft:
-        ap.error("resume points are for full-weight runs (--full_ft 1)")
+    if a.stop_after and not a.full_ft:
+        ap.error("--stop_after is for full-weight runs (--full_ft 1)")
     try: fractions = full_ft.snapshot_fractions(a.snapshot_fractions)
     except ValueError as error: ap.error(str(error))
     if a.snapshot_every_steps < 0 or ((fractions or a.snapshot_every_steps) and not a.full_ft):
@@ -551,6 +551,52 @@ def pinned_revision(a, manifest):
     if manifest and not revision:
         raise ValueError("base not pinned by the suite; pass --base_revision")
     return revision
+
+
+def _save_lora_resume(out_dir: Path, step: int, model, opt, sched, position: dict):
+    """Save a LoRA resume point (rank 0 only): adapter weights, head, optimizer/scheduler/rng, position."""
+    target = out_dir / "resume" / f"step-{step:07d}"
+    target.mkdir(parents=True, exist_ok=True)
+    # adapter weights (PEFT standard layout)
+    model.lm.save_pretrained(str(target / "adapter"))
+    # pointer head
+    torch.save(model.head.state_dict(), target / ".head.pt.tmp")
+    os.replace(target / ".head.pt.tmp", target / "head.pt")
+    # optimizer + scheduler + rng
+    rng = {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state() if torch.cuda.is_initialized() else None}
+    torch.save({"optimizer": opt.state_dict(), "scheduler": sched.state_dict(), "rng": rng},
+               target / ".opt.pt.tmp")
+    os.replace(target / ".opt.pt.tmp", target / "opt.pt")
+    # commit position atomically; prune older points
+    write_json(out_dir / "resume" / "latest.json", {"dir": target.name, "step": step, **position}, atomic=True)
+    for old in (out_dir / "resume").glob("step-*"):
+        if int(old.name.removeprefix("step-")) < step: shutil.rmtree(old)
+
+
+def _load_lora_resume(out_dir: Path, model, opt, sched, args: dict):
+    """Restore a LoRA resume point; returns the position dict or None (no point exists)."""
+    latest = out_dir / "resume" / "latest.json"
+    if not latest.exists(): return None
+    position = read_json(latest)
+    saved_args = position.get("args", {})
+    changed = sorted(k for k in set(args) | set(saved_args) if args.get(k) != saved_args.get(k))
+    if changed:
+        raise ValueError(f"resume point was written with different arguments: {changed}")
+    target = out_dir / "resume" / position["dir"]
+    # restore adapter weights into the already-initialised PeftModel
+    from peft import set_peft_model_state_dict
+    from peft.utils import load_peft_weights
+    adapter_weights = load_peft_weights(str(target / "adapter"), device="cpu")
+    set_peft_model_state_dict(model.lm, adapter_weights)
+    # restore head (keep on same device as model)
+    dev = next(model.head.parameters()).device
+    model.head.load_state_dict(torch.load(target / "head.pt", map_location=dev, weights_only=True))
+    # restore optimizer + scheduler + rng
+    saved = torch.load(target / "opt.pt", map_location="cpu", weights_only=True)
+    opt.load_state_dict(saved["optimizer"]); sched.load_state_dict(saved["scheduler"])
+    torch.set_rng_state(saved["rng"]["torch"])
+    if saved["rng"]["cuda"] is not None: torch.cuda.set_rng_state(saved["rng"]["cuda"])
+    return position
 
 
 def _fmt_dur(secs: float) -> str:
@@ -672,7 +718,9 @@ def main():
     step = seen = tokens_seen = peak_mem = optimizer_seconds = elapsed = start_epoch = start_mb = 0; step_seconds, resume_seconds = [], []; run = Counter()
     grad_norms = []   # per epoch, each optimizer step's global gradient norm before clipping
     resume_dir, resume_args = out_dir / "resume", {k: v for k, v in vars(a).items() if k not in RESUME_KNOBS}
-    position = full_ft.load_resume(resume_dir, opt, sched, resume_args) if a.resume else None
+    position = full_ft.load_resume(resume_dir, opt, sched, resume_args) if (a.resume and a.full_ft) else None
+    if not a.full_ft and a.resume:
+        position = _load_lora_resume(out_dir, model, opt, sched, resume_args)
     if position:
         step, seen, tokens_seen, peak_mem, optimizer_seconds, step_seconds, elapsed, start_epoch, start_mb, grad_norms = (position[k] for k in RESUMED)
         seen, tokens_seen = seen / world, tokens_seen / world   # saved as sums over the ranks (global_sum below adds them back)
@@ -786,6 +834,11 @@ def main():
                     values = (step, *full_ft.global_sum([seen, tokens_seen]), peak_mem, optimizer_seconds, step_seconds, time.time() - t0, ep, mb + 1, grad_norms)
                     writer.save(step, opt, sched, {**dict(zip(RESUMED, values)), "run": dict(run), "world": world, "args": resume_args}, after=snapshots)
                     resume_seconds.append(round(time.time() - last, 3)); saved_at = last = time.time()   # the time training blocked, not part of the next step's
+                if not a.full_ft and not rank and full_ft.save_due(step, a.save_every_steps, a.save_every_minutes, saved_at, max(resume_seconds, default=0)):
+                    values = (step, seen, tokens_seen, peak_mem, optimizer_seconds, step_seconds, time.time() - t0, ep, mb + 1, grad_norms)
+                    _save_lora_resume(out_dir, step, model, opt, sched, {**dict(zip(RESUMED, values)), "run": dict(run), "args": resume_args})
+                    resume_seconds.append(round(time.time() - last, 3)); saved_at = last = time.time()
+                    print(f"  resume point saved at step {step}", flush=True)
                 if step == a.stop_after: stopped = True; break
         if step == steps or stopped: break
     if writer: writer.wait()   # a resume point being written in the background is finished (and then superseded, or continued from)

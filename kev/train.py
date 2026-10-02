@@ -468,6 +468,7 @@ def parse_args():
     ap.add_argument("--swanlab", default="", help="SwanLab project name; enables experiment tracking (pip install swanlab). "
                                                   "Set SWANLAB_API_KEY or run `swanlab login` first. "
                                                   "Pass 'disabled' to run offline without uploading.")
+    ap.add_argument("--log_every", type=int, default=10, help="log training metrics every this many optimizer steps (default 10)")
     a = ap.parse_args()
     if a.shared_prefix is None: a.shared_prefix = a.full_ft
     if min(a.epochs, a.accum, a.n_per_source, a.lora, a.batch, a.synthetic_repeat) < 1 or not 0 < a.public_frac <= 1:
@@ -696,19 +697,55 @@ def main():
                 sched.step(); opt.zero_grad(); step += 1
                 step_seconds.append(round(time.time() - last, 3)); last = time.time()
                 if dev == "mps": empty_cache(dev)   # MPS only: per-step cache release keeps the unified-memory footprint down; on CUDA it would just slow the step
-                if step % 10 == 0:
-                    loss_val = run['ce'] / run['n']
-                    print(f"ep{ep} step {step}/{steps} loss {loss_val:.3f} kl {run['kl']/max(run['kl_n'],1):.3f} anchor {run['anchor']/max(run['anchor_n'],1):.3f} {(time.time()-t0)/seen:.3f}s/rec", flush=True)
-                    if swan is not None:
-                        swan.log({
-                            "train/loss": loss_val,
-                            "train/kl": run["kl"] / max(run["kl_n"], 1),
-                            "train/anchor": run["anchor"] / max(run["anchor_n"], 1),
-                            "train/lr": sched.get_last_lr()[0],
-                            "train/grad_norm": round(opt.grad_norm if a.full_ft else norm, 6),
-                            "train/epoch": round(ep + mb / max(len(plan), 1), 4),
-                            "train/sec_per_rec": round((time.time() - t0) / seen, 3),
-                        }, step=step)
+                if step % a.log_every == 0:
+                    loss_val  = run['ce'] / run['n']
+                    kl_val    = run['kl'] / max(run['kl_n'], 1)
+                    anch_val  = run['anchor'] / max(run['anchor_n'], 1)
+                    gn_val    = round(opt.grad_norm if a.full_ft else norm, 6)
+                    lr_val    = sched.get_last_lr()[0]
+                    ep_frac   = round(ep + mb / max(len(plan), 1), 4)
+                    wall_now  = time.time() - t0
+                    sec_rec   = round(wall_now / seen, 3)
+                    tok_s     = round(tokens_seen / wall_now) if wall_now > 0 else 0
+                    mem_gb    = round(peak_mem / 1e9, 2)
+                    print(
+                        f"ep{ep} step {step}/{steps}  "
+                        f"loss {loss_val:.4f}  kl {kl_val:.4f}  anchor {anch_val:.4f}  "
+                        f"lr {lr_val:.2e}  gnorm {gn_val:.4f}  "
+                        f"mem {mem_gb}GB  tok/s {tok_s}  {sec_rec}s/rec",
+                        flush=True,
+                    )
+                    if not rank:
+                        log_row = {
+                            "step": step, "steps": steps,
+                            "epoch": ep_frac,
+                            "loss": round(loss_val, 6),
+                            "kl": round(kl_val, 6),
+                            "anchor": round(anch_val, 6),
+                            "lr": round(lr_val, 8),
+                            "grad_norm": gn_val,
+                            "peak_mem_gb": mem_gb,
+                            "tokens_per_sec": tok_s,
+                            "sec_per_rec": sec_rec,
+                            "records_seen": round(seen),
+                            "tokens_seen": round(tokens_seen),
+                            "wall_seconds": round(wall_now, 1),
+                        }
+                        with open(out_dir / "training_log.jsonl", "a", encoding="utf-8") as _lf:
+                            _lf.write(json.dumps(log_row, ensure_ascii=False) + "\n")
+                        if swan is not None:
+                            swan.log({
+                                "train/loss": loss_val,
+                                "train/kl": kl_val,
+                                "train/anchor": anch_val,
+                                "train/lr": lr_val,
+                                "train/grad_norm": gn_val,
+                                "train/epoch": ep_frac,
+                                "train/sec_per_rec": sec_rec,
+                                "train/tokens_per_sec": tok_s,
+                                "train/peak_mem_gb": mem_gb,
+                                "train/records_seen": round(seen),
+                            }, step=step)
                     run = Counter()
                 if step == steps: break
                 if snapshots and snapshots.due(step):

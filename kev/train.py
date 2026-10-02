@@ -465,6 +465,9 @@ def parse_args():
     ap.add_argument("--snapshot_every_steps", type=int, default=0, help="full-weight: also write a snapshot every N optimizer steps")
     ap.add_argument("--snapshot_dir", default="", help="where snapshots go (default <out>-snapshots; a study trial's are <trial>/snapshots)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--swanlab", default="", help="SwanLab project name; enables experiment tracking (pip install swanlab). "
+                                                  "Set SWANLAB_API_KEY or run `swanlab login` first. "
+                                                  "Pass 'disabled' to run offline without uploading.")
     a = ap.parse_args()
     if a.shared_prefix is None: a.shared_prefix = a.full_ft
     if min(a.epochs, a.accum, a.n_per_source, a.lora, a.batch, a.synthetic_repeat) < 1 or not 0 < a.public_frac <= 1:
@@ -612,6 +615,21 @@ def main():
     if not rank:
         write_json(out_dir / "training_config.json", {"args": vars(a), "suite_sha256": suite_hash, "base_revision": revision, "init_source": init_source,
                                                     "ordinal_objective": "ranked_probability_score", "holdout": holdout})
+    # SwanLab: rank 0 only; lazy import so it is not required
+    swan = None
+    if a.swanlab and not rank:
+        try:
+            import swanlab
+            _mode = "disabled" if a.swanlab == "disabled" else "cloud"
+            swan = swanlab.init(
+                project=a.swanlab if a.swanlab != "disabled" else "kev",
+                config=vars(a),
+                mode=_mode,
+                logdir=str(out_dir / "swanlab"),
+            )
+            print(f"swanlab: project={swan.project} mode={_mode}", flush=True)
+        except ImportError:
+            print("swanlab not installed; skipping (pip install swanlab)", flush=True)
     print(f"{len(reqs)} training requests (holdout={holdout}), questions by type "
           f"{dict(Counter(q['qtype'] for r in reqs for q in materialize(r)['questions']))}")
 
@@ -679,7 +697,18 @@ def main():
                 step_seconds.append(round(time.time() - last, 3)); last = time.time()
                 if dev == "mps": empty_cache(dev)   # MPS only: per-step cache release keeps the unified-memory footprint down; on CUDA it would just slow the step
                 if step % 10 == 0:
-                    print(f"ep{ep} step {step}/{steps} loss {run['ce']/run['n']:.3f} kl {run['kl']/max(run['kl_n'],1):.3f} anchor {run['anchor']/max(run['anchor_n'],1):.3f} {(time.time()-t0)/seen:.3f}s/rec", flush=True)
+                    loss_val = run['ce'] / run['n']
+                    print(f"ep{ep} step {step}/{steps} loss {loss_val:.3f} kl {run['kl']/max(run['kl_n'],1):.3f} anchor {run['anchor']/max(run['anchor_n'],1):.3f} {(time.time()-t0)/seen:.3f}s/rec", flush=True)
+                    if swan is not None:
+                        swan.log({
+                            "train/loss": loss_val,
+                            "train/kl": run["kl"] / max(run["kl_n"], 1),
+                            "train/anchor": run["anchor"] / max(run["anchor_n"], 1),
+                            "train/lr": sched.get_last_lr()[0],
+                            "train/grad_norm": round(opt.grad_norm if a.full_ft else norm, 6),
+                            "train/epoch": round(ep + mb / max(len(plan), 1), 4),
+                            "train/sec_per_rec": round((time.time() - t0) / seen, 3),
+                        }, step=step)
                     run = Counter()
                 if step == steps: break
                 if snapshots and snapshots.due(step):
@@ -716,6 +745,8 @@ def main():
                "weights": meta.weights, "peak_device_bytes": peak_mem, "device": dev, "dtype": a.dtype, "batch": a.batch,
                "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)})
     print("saved", a.out, flush=True)
+    if swan is not None:
+        swan.finish()
 
 
 if __name__ == "__main__":

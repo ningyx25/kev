@@ -85,10 +85,10 @@ def encode_vision(tok, rec, image_paths, processor,
     Each image produces:  <|vision_start|>  <|image_pad|>×N  <|vision_end|>
     All blocks are prepended in order before the state tokens.
 
-    max_pixels: if set, images larger than this (in total pixels) are
-    downscaled proportionally before processing, bounding the image token
-    count to max_pixels // (patch_size² × merge_size²).  A useful value
-    for training on 40-45 GB GPUs is 524_288 (→ ~512 image tokens).
+    max_pixels: int, or a list with one cap per image (history frames can get a smaller cap than the
+    current one). Images larger than their cap (in total pixels) are downscaled proportionally before
+    processing, bounding that image's token count to cap // (patch_size² × merge_size²).  A useful
+    single value for training on 40-45 GB GPUs is 524_288 (→ ~512 image tokens). 0/None = no cap.
 
     Additional keys in the returned dict:
       pixel_values   – [total_patches, C*t*h*w] float tensor (all images concat)
@@ -99,6 +99,13 @@ def encode_vision(tok, rec, image_paths, processor,
 
     if isinstance(image_paths, str):
         image_paths = [image_paths]
+    if isinstance(max_pixels, (int, float)) or max_pixels is None:
+        caps = [max_pixels] * len(image_paths)
+    else:
+        caps = list(max_pixels)
+        if len(caps) == 1: caps = caps * len(image_paths)   # one explicit cap applies to every image
+        elif len(caps) != len(image_paths):
+            raise ValueError(f"max_pixels has {len(caps)} caps but {len(image_paths)} images")
 
     vs_id = tok.convert_tokens_to_ids(_VISION_START_TOKEN)
     ip_id = tok.convert_tokens_to_ids(_IMAGE_PAD_TOKEN)
@@ -108,10 +115,10 @@ def encode_vision(tok, rec, image_paths, processor,
     all_grid_thw = []
     all_prefix_ids = []
 
-    for img_path in image_paths:
+    for img_path, cap in zip(image_paths, caps):
         img = Image.open(img_path).convert("RGB")
-        if max_pixels is not None and img.width * img.height > max_pixels:
-            scale = (max_pixels / (img.width * img.height)) ** 0.5
+        if cap and img.width * img.height > cap:
+            scale = (cap / (img.width * img.height)) ** 0.5
             new_w = max(1, int(img.width * scale))
             new_h = max(1, int(img.height * scale))
             img = img.resize((new_w, new_h), Image.LANCZOS)

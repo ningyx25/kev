@@ -493,13 +493,18 @@ def load_vision_records(path, images_root=None, source="custom"):
         if target_dict is not None:
             question_entry["target"] = target_dict
         # resolve image paths: v2 history_images + images; v1 single image. history_images keeps one entry per history
-        # step and a step without a screenshot is null — only the real paths go to the model.
-        raw_paths: list[str] = []
+        # step and a step without a screenshot is null — only the real paths go to the model. History and current
+        # frames are kept as separate lists so training can cap their resolution differently (image_paths stays the
+        # flat history-then-current order the encoder consumes).
+        history_raw: list[str] = []
+        current_raw: list[str] = []
         if "images" in r or "history_images" in r:
-            raw_paths = [x for x in (r.get("history_images") or []) + (r.get("images") or []) if x]
+            history_raw = [x for x in (r.get("history_images") or []) if x]
+            current_raw = [x for x in (r.get("images") or []) if x]
         elif "image" in r and r["image"]:
-            raw_paths = [r["image"]]
-        image_paths = [_resolve(p) for p in raw_paths]
+            current_raw = [r["image"]]
+        image_paths = [_resolve(p) for p in history_raw + current_raw]
+        n_history = len(history_raw)
         state_text = json.dumps(r["state"], sort_keys=True, ensure_ascii=False) if not isinstance(r["state"], str) else r["state"]
         rec = {
             "state": r["state"],
@@ -515,6 +520,7 @@ def load_vision_records(path, images_root=None, source="custom"):
                 "dataset": r.get("dataset", source),
                 "text_sha256": hashlib.sha256(" ".join(state_text.casefold().split()).encode()).hexdigest(),
                 "image_paths": image_paths,
+                "n_history": n_history,
             },
         }
         records.append(rec)

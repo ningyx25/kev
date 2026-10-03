@@ -329,7 +329,18 @@ def encode_batch(model, tok, a, chunk, epoch, pairs=None, vision_processor=None)
     is given; otherwise they fall through to the plain text encode() path."""
     out, c = [], training_context(a.max_state)
     limits = {"max_state": c["max_state"], "max_branch": c["max_branch"]}
-    max_pixels = a.max_image_pixels or None
+    cur_pixels  = a.max_image_pixels or None
+    hist_pixels = a.max_history_pixels or cur_pixels
+
+    def _img_caps(meta):
+        """Per-image pixel caps: history frames get hist_pixels, current frames get cur_pixels."""
+        paths = meta.get("image_paths") or []
+        if not paths: return None
+        n_hist = meta.get("n_history", 0)
+        caps = [hist_pixels] * n_hist + [cur_pixels] * (len(paths) - n_hist)
+        # if all caps are identical, collapse to a scalar (backward-compat)
+        return caps[0] if len(set(caps)) == 1 else caps
+
     for req in chunk:
         variants, item_rng = record_variants(req, a, epoch, pairs)
         for v in variants:
@@ -340,7 +351,7 @@ def encode_batch(model, tok, a, chunk, epoch, pairs=None, vision_processor=None)
                 img_paths = [req["_meta"]["image_path"]]
             if img_paths and vision_processor is not None:
                 from .vision_model import encode_vision as _enc_vision
-                enc = _enc_vision(tok, rec, img_paths, vision_processor, strict=True, max_pixels=max_pixels, **limits)
+                enc = _enc_vision(tok, rec, img_paths, vision_processor, strict=True, max_pixels=_img_caps(req["_meta"]), **limits)
             else:
                 enc = model.encode(tok, rec, strict=True, **limits)
             if len(enc["ids"]) > c["max_packed"]:
@@ -350,7 +361,7 @@ def encode_batch(model, tok, a, chunk, epoch, pairs=None, vision_processor=None)
                 sub = rec if len(parts) == 1 else {**rec, "questions": [rec["questions"][q] for q in part]}
                 if img_paths and vision_processor is not None:
                     from .vision_model import encode_vision as _enc_vision
-                    sub_enc = enc if sub is rec else _enc_vision(tok, sub, img_paths, vision_processor, strict=True, max_pixels=max_pixels, **limits)
+                    sub_enc = enc if sub is rec else _enc_vision(tok, sub, img_paths, vision_processor, strict=True, max_pixels=_img_caps(req["_meta"]), **limits)
                 else:
                     sub_enc = enc if sub is rec else model.encode(tok, sub, strict=True, **limits)
                 out.append(Variant(sub, sub_enc, req["_meta"]["id"], req["_meta"]["source"],
@@ -362,7 +373,7 @@ def encode_batch(model, tok, a, chunk, epoch, pairs=None, vision_processor=None)
                 img_paths = [req["_meta"]["image_path"]]
             if img_paths and vision_processor is not None:
                 from .vision_model import encode_vision as _enc_vision
-                enc2 = _enc_vision(tok, rec2, img_paths, vision_processor, strict=True, max_pixels=max_pixels, **limits)
+                enc2 = _enc_vision(tok, rec2, img_paths, vision_processor, strict=True, max_pixels=_img_caps(req["_meta"]), **limits)
             else:
                 enc2 = model.encode(tok, rec2, strict=True, **limits)
             out[-1].permuted = (enc2, perms)
@@ -443,7 +454,8 @@ def parse_args():
     ap.add_argument("--vision_data", default="", help="ac-jev-style JSONL with a single `question` and `image` path per record (see kev.data.load_vision_records); enables vision training with VisionDecisionModel")
     ap.add_argument("--vision_base", default="", help="local path to the Qwen3VL checkpoint used as the backbone when --vision_data is set (default: the value of --base)")
     ap.add_argument("--images_root", default="", help="root directory that `image` paths in --vision_data are relative to (default: directory containing --vision_data); the ac-jev datasets use the dohnuts repo root")
-    ap.add_argument("--max_image_pixels", type=int, default=0, help="with --vision_data: cap total pixels per image before processing (0 = no cap); limits image token count to max_image_pixels//(patch_size^2 * merge_size^2). Recommended: 524288 (~512 tokens) for 40-45 GB GPUs")
+    ap.add_argument("--max_image_pixels", type=int, default=0, help="with --vision_data: cap total pixels per current-frame image before processing (0 = no cap)")
+    ap.add_argument("--max_history_pixels", type=int, default=0, help="with --vision_data: cap total pixels per history-frame image before processing (0 = same as --max_image_pixels)")
     ap.add_argument("--max_state", type=int, default=MAX_STATE, help=f"state tokens per training record (default {MAX_STATE}); raising it admits long-state --data records, the packed limit grows by the same amount")
     ap.add_argument("--replay", type=int, default=0, help="with --data and --suite: mix in this many records sampled (by --seed) from the suite's training partition, so a delta fine-tune does not forget the released recipe")
     ap.add_argument("--init_from", default="", help="delta mode: warm-start LoRA and the pointer head from an existing run "

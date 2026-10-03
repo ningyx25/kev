@@ -153,7 +153,13 @@ class Variant:
 
     @property
     def tokens(self):
-        return len(self.enc["ids"]) + (len(self.permuted[0]["ids"]) if self.permuted else 0)
+        # enc is either a kev dict (has "ids") or an EncodedRecord (has input_ids)
+        enc_len = len(self.enc.get("ids") if isinstance(self.enc, dict) else self.enc.input_ids)
+        perm_len = 0
+        if self.permuted:
+            p0 = self.permuted[0]
+            perm_len = len(p0.get("ids") if isinstance(p0, dict) else p0.input_ids)
+        return enc_len + perm_len
 
 
 def shape(enc):
@@ -326,7 +332,10 @@ def plan_shapes(model, tok, a, reqs, epoch, pairs, state_tokens):
 def encode_batch(model, tok, a, chunk, epoch, pairs=None, vision_processor=None):
     """Each request's variants for this epoch (record_variants), optionally a permuted copy for the KL term, encoded
     strictly.  Vision records (those with _meta["image_paths"]) are encoded via encode_vision() when vision_processor
-    is given; otherwise they fall through to the plain text encode() path."""
+    is given; otherwise they fall through to the plain text encode() path.
+    ClefDecisionModel uses encode_record() (chat template) instead of the kev packed format."""
+    from .clef_model import ClefDecisionModel as _ClefModel
+    is_clef = isinstance(model, _ClefModel)
     out, c = [], training_context(a.max_state)
     limits = {"max_state": c["max_state"], "max_branch": c["max_branch"]}
     cur_pixels  = a.max_image_pixels or None
@@ -338,7 +347,6 @@ def encode_batch(model, tok, a, chunk, epoch, pairs=None, vision_processor=None)
         if not paths: return None
         n_hist = meta.get("n_history", 0)
         caps = [hist_pixels] * n_hist + [cur_pixels] * (len(paths) - n_hist)
-        # if all caps are identical, collapse to a scalar (backward-compat)
         return caps[0] if len(set(caps)) == 1 else caps
 
     for req in chunk:
@@ -346,27 +354,38 @@ def encode_batch(model, tok, a, chunk, epoch, pairs=None, vision_processor=None)
         for v in variants:
             rec = materialize(v)
             img_paths = req.get("_meta", {}).get("image_paths") or []
-            # backward-compat: old records may still carry image_path (str)
             if not img_paths and req.get("_meta", {}).get("image_path"):
                 img_paths = [req["_meta"]["image_path"]]
-            if img_paths and vision_processor is not None:
+            if is_clef:
+                # ClefDecisionModel: encode from original request (has criteria dicts with descriptions)
+                # but store materialized rec in Variant.rec so batch_loss gets the right label/target format
+                enc = model.encode(tok, v, max_state=c["max_state"],
+                                   image_paths=img_paths or None,
+                                   max_pixels_caps=_img_caps(req["_meta"]),
+                                   processor=vision_processor)
+                out.append(Variant(rec, enc, req["_meta"]["id"], req["_meta"]["source"], share=1.0))
+            elif img_paths and vision_processor is not None:
                 from .vision_model import encode_vision as _enc_vision
                 enc = _enc_vision(tok, rec, img_paths, vision_processor, strict=True, max_pixels=_img_caps(req["_meta"]), **limits)
+                if len(enc["ids"]) > c["max_packed"]:
+                    raise ValueError(f"training request exceeds {c['max_packed']} packed tokens")
+                parts = question_parts(enc, a.row_budget, a.shared_prefix)
+                for part in parts:
+                    sub = rec if len(parts) == 1 else {**rec, "questions": [rec["questions"][q] for q in part]}
+                    sub_enc = enc if sub is rec else _enc_vision(tok, sub, img_paths, vision_processor, strict=True, max_pixels=_img_caps(req["_meta"]), **limits)
+                    out.append(Variant(sub, sub_enc, req["_meta"]["id"], req["_meta"]["source"],
+                                       share=len(part) / len(rec["questions"])))
             else:
                 enc = model.encode(tok, rec, strict=True, **limits)
-            if len(enc["ids"]) > c["max_packed"]:
-                raise ValueError(f"training request exceeds {c['max_packed']} packed tokens")
-            parts = question_parts(enc, a.row_budget, a.shared_prefix)
-            for part in parts:   # one part unless --row_budget splits a record whose rows do not fit one pass
-                sub = rec if len(parts) == 1 else {**rec, "questions": [rec["questions"][q] for q in part]}
-                if img_paths and vision_processor is not None:
-                    from .vision_model import encode_vision as _enc_vision
-                    sub_enc = enc if sub is rec else _enc_vision(tok, sub, img_paths, vision_processor, strict=True, max_pixels=_img_caps(req["_meta"]), **limits)
-                else:
+                if len(enc["ids"]) > c["max_packed"]:
+                    raise ValueError(f"training request exceeds {c['max_packed']} packed tokens")
+                parts = question_parts(enc, a.row_budget, a.shared_prefix)
+                for part in parts:
+                    sub = rec if len(parts) == 1 else {**rec, "questions": [rec["questions"][q] for q in part]}
                     sub_enc = enc if sub is rec else model.encode(tok, sub, strict=True, **limits)
-                out.append(Variant(sub, sub_enc, req["_meta"]["id"], req["_meta"]["source"],
-                                   share=len(part) / len(rec["questions"])))
-        if a.perm_kl > 0 and item_rng.random() < a.perm_frac and any(q["qtype"] == "choice" and len(q["options"]) >= 3 for q in rec["questions"]):
+                    out.append(Variant(sub, sub_enc, req["_meta"]["id"], req["_meta"]["source"],
+                                       share=len(part) / len(rec["questions"])))
+        if not is_clef and a.perm_kl > 0 and item_rng.random() < a.perm_frac and any(q["qtype"] == "choice" and len(q["options"]) >= 3 for q in rec["questions"]):
             rec2, perms = permuted_copy(rec, item_rng)
             img_paths = req.get("_meta", {}).get("image_paths") or []
             if not img_paths and req.get("_meta", {}).get("image_path"):
@@ -456,6 +475,12 @@ def parse_args():
     ap.add_argument("--images_root", default="", help="root directory that `image` paths in --vision_data are relative to (default: directory containing --vision_data); the ac-jev datasets use the dohnuts repo root")
     ap.add_argument("--max_image_pixels", type=int, default=0, help="with --vision_data: cap total pixels per current-frame image before processing (0 = no cap)")
     ap.add_argument("--max_history_pixels", type=int, default=0, help="with --vision_data: cap total pixels per history-frame image before processing (0 = same as --max_image_pixels)")
+    ap.add_argument("--clef", type=int, choices=[0, 1], default=0, help="use JointSchemaHead (clef architecture) instead of PointerHead; requires --vision_data")
+    ap.add_argument("--clef_width",          type=int, default=1024, help="clef head: hidden width (default 1024)")
+    ap.add_argument("--clef_routing_layers", type=int, default=2,    help="clef head: evidence routing layers (default 2)")
+    ap.add_argument("--clef_layers",         type=int, default=4,    help="clef head: joint decoder layers (default 4)")
+    ap.add_argument("--clef_heads",          type=int, default=16,   help="clef head: attention heads (default 16)")
+    ap.add_argument("--clef_feedforward",    type=int, default=4096, help="clef head: feedforward width (default 4096)")
     ap.add_argument("--max_state", type=int, default=MAX_STATE, help=f"state tokens per training record (default {MAX_STATE}); raising it admits long-state --data records, the packed limit grows by the same amount")
     ap.add_argument("--replay", type=int, default=0, help="with --data and --suite: mix in this many records sampled (by --seed) from the suite's training partition, so a delta fine-tune does not forget the released recipe")
     ap.add_argument("--init_from", default="", help="delta mode: warm-start LoRA and the pointer head from an existing run "
@@ -659,7 +684,21 @@ def main():
 
     tok = load_tokenizer(a.vision_base or a.base if a.vision_data else a.base, revision=revision)
     vision_processor = None
-    if a.vision_data:
+    if a.vision_data and a.clef:
+        from .clef_model import ClefDecisionModel, DEFAULT_HEAD_CONFIG
+        from .vision_model import load_vision_processor
+        vision_base = a.vision_base or a.base
+        vision_processor = load_vision_processor(vision_base)
+        head_config = dict(width=a.clef_width, routing_layers=a.clef_routing_layers,
+                           layers=a.clef_layers, heads=a.clef_heads, feedforward=a.clef_feedforward)
+        model = ClefDecisionModel(vision_base, tok, dev,
+                                  lora=None if a.full_ft else a.lora,
+                                  head_config=head_config,
+                                  dtype=torch.bfloat16 if a.weights_dtype == "bf16" else torch.float32,
+                                  direct_load=bool(a.full_ft),
+                                  processor=vision_processor)
+        print(f"clef: JointSchemaHead({head_config})", flush=True)
+    elif a.vision_data:
         from .vision_model import VisionDecisionModel, load_vision_processor
         vision_base = a.vision_base or a.base
         vision_processor = load_vision_processor(vision_base)
@@ -870,8 +909,13 @@ def main():
     if rank: return
     backbone_seconds = time.time() - t0 - wall
     shutil.rmtree(resume_dir, ignore_errors=True)   # the checkpoint supersedes it
-    meta.head, meta.extra = model.head.state_dict(), {"args": vars(a), "suite_sha256": suite_hash, "init_source": init_source}
-    finish_checkpoint(a.out, meta, tok)
+    from .clef_model import ClefDecisionModel as _ClefModel
+    if isinstance(model, _ClefModel):
+        from .clef_model import save_clef_head
+        save_clef_head(model, a.out)
+    else:
+        meta.head, meta.extra = model.head.state_dict(), {"args": vars(a), "suite_sha256": suite_hash, "init_source": init_source}
+        finish_checkpoint(a.out, meta, tok)
     write_json(out_dir / "training_metrics.json", {"wall_seconds": wall, "records_seen": round(seen),
                "requested_records": a.epochs * len(reqs), "truncated_records": 0, "rejected_records": 0,
                "optimizer_steps": step, "forward_tokens": round(tokens_seen), "step_seconds": step_seconds, "optimizer_seconds": optimizer_seconds, "resume_seconds": resume_seconds, "resume_write_seconds": writer.seconds if writer else [], "world_size": world,

@@ -388,7 +388,15 @@ def load_records(path, source="custom"):
 
 def load_vision_records(path, images_root=None, source="custom"):
     """Labelled requests from an ac-jev-style JSONL file where each record carries a single
-    `question` (not `questions`) and an `image` path, plus a `target` soft-label list.
+    `question` (not `questions`) and one or more image paths, plus a `target` soft-label list.
+
+    Supported image fields (in priority order):
+      - `"images"`: list[str] — current-frame screenshot(s)  [v2 format]
+      - `"history_images"`: list[str] — prepended before `images` (history first) [v2 format]
+      - `"image"`: str — single image path  [v1 format, backward-compat]
+
+    All paths are resolved against `images_root` (defaults to the directory of `path`).
+    Records with no image field are accepted (text-only).
 
     Each record is converted to the standard labelled-request shape (compatible with
     materialize() and load_records()), with:
@@ -397,9 +405,9 @@ def load_vision_records(path, images_root=None, source="custom"):
         `target` is a dict keyed by the criteria keys (choice), ["false","true"] (noul),
         or level-index strings (score), matching the same convention as materialize().
         `label` is the argmax of the soft-target list; hard-label fallback when no `target`.
-      - `_meta["image_path"]`: resolved absolute path to the image file.
+      - `_meta["image_paths"]`: list[str] of resolved absolute image paths (may be empty).
 
-    `images_root` is prepended to relative `image` paths; defaults to the directory
+    `images_root` is prepended to relative image paths; defaults to the directory
     that contains `path`.
     """
     path = Path(path)
@@ -407,11 +415,26 @@ def load_vision_records(path, images_root=None, source="custom"):
         images_root = path.parent
     images_root = Path(images_root)
     records = []
+
+    def _resolve(img_path):
+        p = Path(img_path)
+        return str(p if p.is_absolute() else images_root / p)
+
     with path.open(encoding="utf-8") as f:
+        buf, line_start = [], 0
         for n, line in enumerate(f):
             if not line.strip():
                 continue
-            r = json.loads(line)
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                # multi-line JSON: accumulate lines
+                buf.append(line)
+                try:
+                    r = json.loads("".join(buf))
+                    buf = []
+                except json.JSONDecodeError:
+                    continue
             if "state" not in r:
                 raise ValueError(f"{path}:{n + 1}: record has no 'state'")
             q = r.get("question")
@@ -454,13 +477,13 @@ def load_vision_records(path, images_root=None, source="custom"):
             }
             if target_dict is not None:
                 question_entry["target"] = target_dict
-            # resolve image path to absolute (images_root / relative, or as-is if absolute)
-            img_path = r.get("image")
-            if img_path is not None:
-                img_abs = Path(img_path)
-                if not img_abs.is_absolute():
-                    img_abs = images_root / img_path
-                img_path = str(img_abs)
+            # resolve image paths: v2 history_images + images; v1 single image
+            raw_paths: list[str] = []
+            if "images" in r or "history_images" in r:
+                raw_paths = list(r.get("history_images") or []) + list(r.get("images") or [])
+            elif "image" in r and r["image"]:
+                raw_paths = [r["image"]]
+            image_paths = [_resolve(p) for p in raw_paths]
             text = json.dumps(r["state"], sort_keys=True, ensure_ascii=False) if not isinstance(r["state"], str) else r["state"]
             rec = {
                 "state": r["state"],
@@ -475,10 +498,9 @@ def load_vision_records(path, images_root=None, source="custom"):
                     "split": r.get("split", "custom"),
                     "dataset": r.get("dataset", source),
                     "text_sha256": hashlib.sha256(" ".join(text.casefold().split()).encode()).hexdigest(),
+                    "image_paths": image_paths,
                 },
             }
-            if img_path is not None:
-                rec["_meta"]["image_path"] = img_path
             records.append(rec)
     if not records:
         raise ValueError(f"{path}: no records")

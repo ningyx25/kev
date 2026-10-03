@@ -76,13 +76,14 @@ def _image_token_count(image_grid_thw: torch.Tensor) -> int:
     return int(t) * (int(h) // _MERGE_SIZE) * (int(w) // _MERGE_SIZE)
 
 
-def encode_vision(tok, rec, image_path: str, processor,
+def encode_vision(tok, rec, image_paths, processor,
                   max_state=MAX_STATE, max_branch=MAX_BRANCH, strict=False,
                   option_isolation=False, max_pixels=None):
-    """Like kev.model.encode() but prepends a vision prefix to the state.
+    """Like kev.model.encode() but prepends one vision block per image to the state.
 
-    The prefix is:  <|vision_start|>  <|image_pad|>×N  <|vision_end|>
-    where N = _image_token_count(image_grid_thw).
+    image_paths: str (single image, backward-compat) or list[str] (one or more images).
+    Each image produces:  <|vision_start|>  <|image_pad|>×N  <|vision_end|>
+    All blocks are prepended in order before the state tokens.
 
     max_pixels: if set, images larger than this (in total pixels) are
     downscaled proportionally before processing, bounding the image token
@@ -90,40 +91,50 @@ def encode_vision(tok, rec, image_path: str, processor,
     for training on 40-45 GB GPUs is 524_288 (→ ~512 image tokens).
 
     Additional keys in the returned dict:
-      pixel_values   – [total_patches, C*t*h*w] float tensor (from the processor)
-      image_grid_thw – [1, 3] long tensor (T, H, W in patch units)
-      n_img_tokens   – int, the N above (length of the image_pad span)
+      pixel_values   – [total_patches, C*t*h*w] float tensor (all images concat)
+      image_grid_thw – [N_imgs, 3] long tensor (T, H, W in patch units per image)
+      n_img_tokens   – int, total number of image_pad tokens across all images
     """
     from PIL import Image
 
-    img = Image.open(image_path).convert("RGB")
-    if max_pixels is not None and img.width * img.height > max_pixels:
-        scale = (max_pixels / (img.width * img.height)) ** 0.5
-        new_w = max(1, int(img.width * scale))
-        new_h = max(1, int(img.height * scale))
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-    proc_out = processor(images=[img], return_tensors="pt")
-    pixel_values   = proc_out["pixel_values"]        # [total_patches, C*t*h*w]
-    image_grid_thw = proc_out["image_grid_thw"]      # [1, 3]
+    if isinstance(image_paths, str):
+        image_paths = [image_paths]
 
-    n_img = _image_token_count(image_grid_thw)
+    vs_id = tok.convert_tokens_to_ids(_VISION_START_TOKEN)
+    ip_id = tok.convert_tokens_to_ids(_IMAGE_PAD_TOKEN)
+    ve_id = tok.convert_tokens_to_ids(_VISION_END_TOKEN)
 
-    # Build the image-prefix token ids once
-    vs_id  = tok.convert_tokens_to_ids(_VISION_START_TOKEN)
-    ip_id  = tok.convert_tokens_to_ids(_IMAGE_PAD_TOKEN)
-    ve_id  = tok.convert_tokens_to_ids(_VISION_END_TOKEN)
-    img_prefix_ids = [vs_id] + [ip_id] * n_img + [ve_id]   # length N+2
-    n_prefix = len(img_prefix_ids)
+    all_pixel_values = []
+    all_grid_thw = []
+    all_prefix_ids = []
 
-    # Encode the text record as usual (max_state reduced by the prefix length so
-    # the combined row still fits; at least 1 state token must remain)
+    for img_path in image_paths:
+        img = Image.open(img_path).convert("RGB")
+        if max_pixels is not None and img.width * img.height > max_pixels:
+            scale = (max_pixels / (img.width * img.height)) ** 0.5
+            new_w = max(1, int(img.width * scale))
+            new_h = max(1, int(img.height * scale))
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+        proc_out = processor(images=[img], return_tensors="pt")
+        pv  = proc_out["pixel_values"]    # [patches_i, C*t*h*w]
+        thw = proc_out["image_grid_thw"]  # [1, 3]
+        n_i = _image_token_count(thw)
+        all_pixel_values.append(pv)
+        all_grid_thw.append(thw)          # [1, 3]
+        all_prefix_ids += [vs_id] + [ip_id] * n_i + [ve_id]
+
+    pixel_values   = torch.cat(all_pixel_values, dim=0)          # [sum_patches, ...]
+    image_grid_thw = torch.cat(all_grid_thw, dim=0)              # [N_imgs, 3]
+    n_img = sum(_image_token_count(thw) for thw in all_grid_thw)
+    n_prefix = len(all_prefix_ids)
+
+    # Encode the text record as usual (max_state reduced by the total prefix length)
     adjusted_max_state = max(1, max_state - n_prefix)
     enc = encode(tok, rec, max_state=adjusted_max_state, max_branch=max_branch,
                  strict=strict, option_isolation=option_isolation)
 
-    # Prepend image tokens (all segment 0, positions 0..n_prefix-1)
-    # and shift existing positions by n_prefix
-    enc["ids"]  = img_prefix_ids + enc["ids"]
+    # Prepend all image-prefix tokens
+    enc["ids"]  = all_prefix_ids + enc["ids"]
     enc["seg"]  = [0] * n_prefix + enc["seg"]
     enc["pos"]  = list(range(n_prefix)) + [p + n_prefix for p in enc["pos"]]
     enc["opt"]  = [OPT_NONE] * n_prefix + enc["opt"]

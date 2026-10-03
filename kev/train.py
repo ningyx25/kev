@@ -325,7 +325,7 @@ def plan_shapes(model, tok, a, reqs, epoch, pairs, state_tokens):
 
 def encode_batch(model, tok, a, chunk, epoch, pairs=None, vision_processor=None):
     """Each request's variants for this epoch (record_variants), optionally a permuted copy for the KL term, encoded
-    strictly.  Vision records (those with _meta["image_path"]) are encoded via encode_vision() when vision_processor
+    strictly.  Vision records (those with _meta["image_paths"]) are encoded via encode_vision() when vision_processor
     is given; otherwise they fall through to the plain text encode() path."""
     out, c = [], training_context(a.max_state)
     limits = {"max_state": c["max_state"], "max_branch": c["max_branch"]}
@@ -334,10 +334,13 @@ def encode_batch(model, tok, a, chunk, epoch, pairs=None, vision_processor=None)
         variants, item_rng = record_variants(req, a, epoch, pairs)
         for v in variants:
             rec = materialize(v)
-            img_path = req.get("_meta", {}).get("image_path")
-            if img_path and vision_processor is not None:
+            img_paths = req.get("_meta", {}).get("image_paths") or []
+            # backward-compat: old records may still carry image_path (str)
+            if not img_paths and req.get("_meta", {}).get("image_path"):
+                img_paths = [req["_meta"]["image_path"]]
+            if img_paths and vision_processor is not None:
                 from .vision_model import encode_vision as _enc_vision
-                enc = _enc_vision(tok, rec, img_path, vision_processor, strict=True, max_pixels=max_pixels, **limits)
+                enc = _enc_vision(tok, rec, img_paths, vision_processor, strict=True, max_pixels=max_pixels, **limits)
             else:
                 enc = model.encode(tok, rec, strict=True, **limits)
             if len(enc["ids"]) > c["max_packed"]:
@@ -345,19 +348,21 @@ def encode_batch(model, tok, a, chunk, epoch, pairs=None, vision_processor=None)
             parts = question_parts(enc, a.row_budget, a.shared_prefix)
             for part in parts:   # one part unless --row_budget splits a record whose rows do not fit one pass
                 sub = rec if len(parts) == 1 else {**rec, "questions": [rec["questions"][q] for q in part]}
-                if img_path and vision_processor is not None:
+                if img_paths and vision_processor is not None:
                     from .vision_model import encode_vision as _enc_vision
-                    sub_enc = enc if sub is rec else _enc_vision(tok, sub, img_path, vision_processor, strict=True, max_pixels=max_pixels, **limits)
+                    sub_enc = enc if sub is rec else _enc_vision(tok, sub, img_paths, vision_processor, strict=True, max_pixels=max_pixels, **limits)
                 else:
                     sub_enc = enc if sub is rec else model.encode(tok, sub, strict=True, **limits)
                 out.append(Variant(sub, sub_enc, req["_meta"]["id"], req["_meta"]["source"],
                                    share=len(part) / len(rec["questions"])))
         if a.perm_kl > 0 and item_rng.random() < a.perm_frac and any(q["qtype"] == "choice" and len(q["options"]) >= 3 for q in rec["questions"]):
             rec2, perms = permuted_copy(rec, item_rng)
-            img_path = req.get("_meta", {}).get("image_path")
-            if img_path and vision_processor is not None:
+            img_paths = req.get("_meta", {}).get("image_paths") or []
+            if not img_paths and req.get("_meta", {}).get("image_path"):
+                img_paths = [req["_meta"]["image_path"]]
+            if img_paths and vision_processor is not None:
                 from .vision_model import encode_vision as _enc_vision
-                enc2 = _enc_vision(tok, rec2, img_path, vision_processor, strict=True, max_pixels=max_pixels, **limits)
+                enc2 = _enc_vision(tok, rec2, img_paths, vision_processor, strict=True, max_pixels=max_pixels, **limits)
             else:
                 enc2 = model.encode(tok, rec2, strict=True, **limits)
             out[-1].permuted = (enc2, perms)

@@ -418,90 +418,106 @@ def load_vision_records(path, images_root=None, source="custom"):
 
     def _resolve(img_path):
         p = Path(img_path)
-        return str(p if p.is_absolute() else images_root / p)
+        if p.is_absolute():
+            return str(p)
+        # v2 records store paths relative to the project root; v1 relative to images_root — whichever exists wins,
+        # falling back to the images_root join (checked again by encode_vision when it opens the file)
+        if p.exists():
+            return str(p)
+        return str(images_root / p)
 
-    with path.open(encoding="utf-8") as f:
-        buf, line_start = [], 0
-        for n, line in enumerate(f):
-            if not line.strip():
-                continue
-            try:
-                r = json.loads(line)
-            except json.JSONDecodeError:
-                # multi-line JSON: accumulate lines
-                buf.append(line)
-                try:
-                    r = json.loads("".join(buf))
-                    buf = []
-                except json.JSONDecodeError:
-                    continue
-            if "state" not in r:
-                raise ValueError(f"{path}:{n + 1}: record has no 'state'")
-            q = r.get("question")
-            if not isinstance(q, dict) or "type" not in q:
-                raise ValueError(f"{path}:{n + 1}: record has no valid 'question'")
-            if "criteria" not in q:
-                raise ValueError(f"{path}:{n + 1}: question has no 'criteria'")
-            # derive the option keys in the same order as the criteria / question type
-            if q["type"] == "choice":
-                keys = list(q["criteria"])
-            elif q["type"] == "noul":
-                keys = ["false", "true"]
-            else:   # score
-                keys = [str(i) for i in range(len(q["criteria"]))]
-            # resolve soft target: list[float] -> dict keyed by option keys
-            target_list = r.get("target")
-            if target_list is not None:
-                if len(target_list) != len(keys):
-                    raise ValueError(
-                        f"{path}:{n + 1}: target length {len(target_list)} != "
-                        f"criteria length {len(keys)}"
-                    )
-                label_idx = max(range(len(target_list)), key=lambda i: target_list[i])
-                label = keys[label_idx]
-                target_dict = {k: float(v) for k, v in zip(keys, target_list)}
-            else:
-                if "label" not in q:
-                    raise ValueError(f"{path}:{n + 1}: question has no 'target' or 'label'")
-                label = q["label"]
-                target_dict = None
-            # use the last colon-separated segment of the record id as the question id
-            rec_id = r.get("id", f"{source}/{n}")
-            qid = rec_id.split(":")[-1]
-            question_entry = {
-                "type": q["type"],
-                "instructions": q.get("instructions"),
-                "criteria": q["criteria"],
-                "label": label,
-                "src": f"{source}_{q['type']}",
-            }
-            if target_dict is not None:
-                question_entry["target"] = target_dict
-            # resolve image paths: v2 history_images + images; v1 single image
-            raw_paths: list[str] = []
-            if "images" in r or "history_images" in r:
-                raw_paths = list(r.get("history_images") or []) + list(r.get("images") or [])
-            elif "image" in r and r["image"]:
-                raw_paths = [r["image"]]
-            image_paths = [_resolve(p) for p in raw_paths]
-            text = json.dumps(r["state"], sort_keys=True, ensure_ascii=False) if not isinstance(r["state"], str) else r["state"]
-            rec = {
-                "state": r["state"],
-                "questions": {qid: question_entry},
-                "_meta": {
-                    **r.get("_meta", {}),
-                    "source": source,
-                    "variant": "clean",
-                    "id": rec_id,
-                    "group_id": r.get("group", rec_id),
-                    "row": n,
-                    "split": r.get("split", "custom"),
-                    "dataset": r.get("dataset", source),
-                    "text_sha256": hashlib.sha256(" ".join(text.casefold().split()).encode()).hexdigest(),
-                    "image_paths": image_paths,
-                },
-            }
-            records.append(rec)
+    # streaming decode: one JSON value after another, whitespace between them ignored. This reads both compact
+    # JSONL (v1: one record per line) and pretty-printed concatenated objects (v2: a record spans many lines) —
+    # line-oriented parsing cannot, a bare line inside an array is itself valid JSON.
+    blob = path.read_text(encoding="utf-8")
+    decoder = json.JSONDecoder()
+    pos, n = 0, 0
+    while True:
+        while pos < len(blob) and blob[pos] in " \t\r\n":
+            pos += 1
+        if pos >= len(blob):
+            break
+        try:
+            r, pos = decoder.raw_decode(blob, pos)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{path}: record {n + 1} is not valid JSON: {error}") from error
+        n += 1
+        if "state" not in r:
+            raise ValueError(f"{path}: record {n}: record has no 'state'")
+        q = r.get("question")
+        if not isinstance(q, dict) or "type" not in q:
+            raise ValueError(f"{path}: record {n}: record has no valid 'question'")
+        if "criteria" not in q:
+            raise ValueError(f"{path}: record {n}: question has no 'criteria'")
+        # derive the option keys in the same order as the criteria / question type
+        if q["type"] == "choice":
+            keys = list(q["criteria"])
+        elif q["type"] == "noul":
+            keys = ["false", "true"]
+        else:   # score
+            keys = [str(i) for i in range(len(q["criteria"]))]
+        # resolve soft target: list[float] -> dict keyed by option keys. The label follows materialize()'s
+        # convention by type (kev/data.py header): choice -> option key, noul -> bool, score -> level index.
+        target_list = r.get("target")
+        if target_list is not None:
+            if len(target_list) != len(keys):
+                raise ValueError(
+                    f"{path}: record {n}: target length {len(target_list)} != "
+                    f"criteria length {len(keys)}"
+                )
+            label_idx = max(range(len(target_list)), key=lambda i: target_list[i])
+            target_dict = {k: float(v) for k, v in zip(keys, target_list)}
+        else:
+            if "label" not in q:
+                raise ValueError(f"{path}: record {n}: question has no 'target' or 'label'")
+            label_idx = None
+            target_dict = None
+        if q["type"] == "noul":
+            if label_idx is not None: label = label_idx == 1
+            elif isinstance(q["label"], str): label = q["label"].casefold() == "true"   # NOT bool(x): "false" is truthy
+            else: label = bool(q["label"])
+        elif q["type"] == "score":
+            label = label_idx if label_idx is not None else int(q["label"])
+        else:   # choice
+            label = keys[label_idx] if label_idx is not None else q["label"]
+        # use the last colon-separated segment of the record id as the question id
+        rec_id = r.get("id", f"{source}/{n}")
+        qid = rec_id.split(":")[-1]
+        question_entry = {
+            "type": q["type"],
+            "instructions": q.get("instructions"),
+            "criteria": q["criteria"],
+            "label": label,
+            "src": f"{source}_{q['type']}",
+        }
+        if target_dict is not None:
+            question_entry["target"] = target_dict
+        # resolve image paths: v2 history_images + images; v1 single image. history_images keeps one entry per history
+        # step and a step without a screenshot is null — only the real paths go to the model.
+        raw_paths: list[str] = []
+        if "images" in r or "history_images" in r:
+            raw_paths = [x for x in (r.get("history_images") or []) + (r.get("images") or []) if x]
+        elif "image" in r and r["image"]:
+            raw_paths = [r["image"]]
+        image_paths = [_resolve(p) for p in raw_paths]
+        state_text = json.dumps(r["state"], sort_keys=True, ensure_ascii=False) if not isinstance(r["state"], str) else r["state"]
+        rec = {
+            "state": r["state"],
+            "questions": {qid: question_entry},
+            "_meta": {
+                **r.get("_meta", {}),
+                "source": source,
+                "variant": "clean",
+                "id": rec_id,
+                "group_id": r.get("group", rec_id),
+                "row": n - 1,
+                "split": r.get("split", "custom"),
+                "dataset": r.get("dataset", source),
+                "text_sha256": hashlib.sha256(" ".join(state_text.casefold().split()).encode()).hexdigest(),
+                "image_paths": image_paths,
+            },
+        }
+        records.append(rec)
     if not records:
         raise ValueError(f"{path}: no records")
     return records

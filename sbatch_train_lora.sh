@@ -14,7 +14,7 @@ PROJECT=/home/ningyongxin/workplace/proj/kev
 cd "$PROJECT"
 source .venv/bin/activate
 
-VISION_DATA=data/processed/ac-jev-v2-subset100/train.jsonl
+VISION_DATA=data/processed/ac-jev-v2/train.jsonl
 VISION_BASE=./Qwen/Qwen3.5-9B
 OUT_DIR=runs/clef-v2-qwen35-9B-lora
 SWANLAB=kev-vision
@@ -33,8 +33,8 @@ torchrun --standalone --nproc_per_node 4 -m kev.train \
   --max_image_pixels $((1024*1024)) \
   --max_history_pixels $((512*512)) \
   --lr 2e-5 --epochs 3 \
-  --save_every_steps 500 \
+  --save_every_steps 50 \
   --log_every 1 \
   --swanlab "$SWANLAB" \
+  --resume 1 \
   --out "$OUT_DIR"
-#   --resume 1

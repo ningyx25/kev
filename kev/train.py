@@ -481,6 +481,8 @@ def parse_args():
     ap.add_argument("--clef_layers",         type=int, default=4,    help="clef head: joint decoder layers (default 4)")
     ap.add_argument("--clef_heads",          type=int, default=16,   help="clef head: attention heads (default 16)")
     ap.add_argument("--clef_feedforward",    type=int, default=4096, help="clef head: feedforward width (default 4096)")
+    ap.add_argument("--clef_max_option_chars", type=int, default=256, help="clef: cap each option description's length (characters) in the schema; a tap_target "
+                                                                            "option can hold raw screen text (30k chars), which alone overflows --max_state (default 256; 0 = no cap)")
     ap.add_argument("--max_state", type=int, default=MAX_STATE, help=f"state tokens per training record (default {MAX_STATE}); raising it admits long-state --data records, the packed limit grows by the same amount")
     ap.add_argument("--replay", type=int, default=0, help="with --data and --suite: mix in this many records sampled (by --seed) from the suite's training partition, so a delta fine-tune does not forget the released recipe")
     ap.add_argument("--init_from", default="", help="delta mode: warm-start LoRA and the pointer head from an existing run "
@@ -571,7 +573,8 @@ def finish_checkpoint(out, meta, tok):
     tok.save_pretrained(out)
 
 
-RESUME_KNOBS = ("resume", "save_every_steps", "save_every_minutes", "stop_after", "snapshot_fractions", "snapshot_every_steps", "snapshot_dir")   # may differ between a run and its continuation
+RESUME_KNOBS = ("resume", "save_every_steps", "save_every_minutes", "stop_after", "snapshot_fractions", "snapshot_every_steps", "snapshot_dir",
+                "clef_max_option_chars")   # may differ between a run and its continuation (the last is a data-encoding fix a crashed run resumes with)
 RESUMED = ("step", "seen", "tokens_seen", "peak_mem", "optimizer_seconds", "step_seconds", "elapsed", "epoch", "microbatch", "grad_norms")   # counters a resume point carries
 
 
@@ -696,7 +699,8 @@ def main():
                                   head_config=head_config,
                                   dtype=torch.bfloat16 if a.weights_dtype == "bf16" else torch.float32,
                                   direct_load=bool(a.full_ft),
-                                  processor=vision_processor)
+                                  processor=vision_processor,
+                                  max_option_chars=a.clef_max_option_chars or None)
         print(f"clef: JointSchemaHead({head_config})", flush=True)
     elif a.vision_data:
         from .vision_model import VisionDecisionModel, load_vision_processor

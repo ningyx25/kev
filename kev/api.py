@@ -44,6 +44,7 @@ class SystemOneRequest(BaseModel):
     state: JSONContent
     model: str = "kev-latest"
     questions: dict[str, Question] = Field(min_length=1)
+    images: list[str] | None = None   # base64-encoded images (raw or data-URI: "data:image/jpeg;base64,..."); clef checkpoints only
 
 
 def render(v: JSONContent, indent: int = 0) -> str:

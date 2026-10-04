@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from .api import SystemOneRequest, to_record, to_answers, output_tokens, with_date_facts
 from .checkpoint import Checkpoint, LoadOptions, fused_available, is_hub_id
+from .clef_model import is_clef, load_clef_checkpoint, systemone as clef_systemone
 from .device import default_device, empty_cache, out_of_memory, sync
 from .model import SERVE_MAX_STATE, ContextOverflow, admit
 
@@ -220,6 +221,56 @@ class Server:
         return body
 
 
+def _decode_images(images: list[str]):
+    """Decode a list of base64-encoded image strings (raw or data-URI) into PIL Images."""
+    import base64, io
+    from PIL import Image
+    out = []
+    for src in images:
+        if src.startswith("data:"):
+            src = src.split(",", 1)[1]
+        out.append(Image.open(io.BytesIO(base64.b64decode(src))))
+    return out
+
+
+@dataclass
+class ClefServer:
+    """Serving wrapper for a clef checkpoint (JointSchemaHead on Qwen3.5).
+
+    Implements the same answer() / answer_async() surface as Server so the
+    FastAPI endpoint functions work without branching. Requests are serialised
+    through a lock (no queue/thread needed: the model does a single blocking
+    forward pass per request)."""
+    model: object
+    processor: object
+    requested: str         # checkpoint path as given on the command line
+    device: str
+    release_date: str
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def close(self):
+        pass   # no background thread
+
+    def wait_idle(self):
+        pass   # no queue
+
+    def answer(self, req):
+        t = time.time()
+        d = prepare(req).model_dump()
+        if d.get("images"):
+            d["images"] = _decode_images(d["images"])
+        else:
+            d.pop("images", None)   # don't pass images=None into clef; it accepts the key absent
+        with self.lock:
+            resp = clef_systemone(self.model, self.processor, d)
+        resp["latency_ms"] = round((time.time() - t) * 1000, 1)
+        return resp
+
+    async def answer_async(self, req):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.answer, req)
+
+
 def prepare(req):
     """Opt-in preprocessing applied to every request before the model sees it."""
     return req.model_copy(update={"state": with_date_facts(req.state)}) if DATE_FACTS else req
@@ -242,7 +293,7 @@ async def typesafe(request, call_next):
     return resp
 
 
-def server() -> Server:
+def server() -> "Server | ClefServer":
     return app.state.server
 
 
@@ -278,10 +329,13 @@ def systemone_permute(r: PermuteSystemOne):
 @app.post("/v1/systemone/separate")
 def systemone_separate(req: SystemOneRequest):
     """Answer each question in its own request against the same state (N passes). For packed-vs-separate comparison."""
-    parts = [server().answer(req.model_copy(update={"questions": {qid: q}})) for qid, q in req.questions.items()]
+    s = server()
+    parts = [s.answer(req.model_copy(update={"questions": {qid: q}})) for qid, q in req.questions.items()]
     answers = {qid: a for p in parts for qid, a in p["answers"].items()}
+    tok = getattr(s, "tok", None)
+    out_tokens = output_tokens(tok, answers) if tok is not None else 0
     body = {"model": req.model, "answers": answers,
-            "usage": {"input_tokens": sum(p["usage"]["input_tokens"] for p in parts), "output_tokens": output_tokens(server().tok, answers)},
+            "usage": {"input_tokens": sum(p["usage"]["input_tokens"] for p in parts), "output_tokens": out_tokens},
             "latency_ms": round(sum(p["latency_ms"] for p in parts), 1)}
     return truncation_marks(body, parts[0])
 
@@ -297,9 +351,13 @@ def truncation_marks(body, part):
 
 @app.get("/v1/models")
 def models():
-    """One TypeSafe model card (name, description, release_date) per accepted model name, plus the Kev serving details
-    a client may ignore: the run, the base, the device, the backend and precision, the temperature, prefix-cache stats."""
+    """One TypeSafe model card (name, description, release_date) per accepted model name, plus serving details
+    a client may ignore. For clef checkpoints only the essential fields are returned."""
     s = server()
+    if isinstance(s, ClefServer):
+        card = {"description": f"Clef joint-schema head on Qwen3.5, serving {s.requested}",
+                "release_date": s.release_date, "run": s.requested, "device": s.device}
+        return {"models": [{"name": name, **card} for name in MODEL_NAMES]}
     ck, meta = s.checkpoint, s.checkpoint.meta
     card = {"description": f"Kev pointer head on {meta.base}, serving {ck.requested} at temperature {s.model.head.temperature:.2f}",
             "release_date": s.release_date,
@@ -312,6 +370,16 @@ def models():
     return {"models": [{"name": name, **card} for name in MODEL_NAMES]}
 
 
+def _file_release_date(path: str) -> str:
+    """ISO date from the newest file mtime in `path` (fallback for local checkpoints without a Hub commit date)."""
+    import datetime
+    MTIME_FLOOR = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc).timestamp()
+    from pathlib import Path
+    files = sorted((p.stat().st_mtime for p in Path(path).iterdir() if p.is_file()), reverse=True)
+    stamp = next((t for t in files if t >= MTIME_FLOOR), None)
+    return "unknown" if stamp is None else datetime.datetime.fromtimestamp(stamp, datetime.timezone.utc).date().isoformat()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default="runs/kev")
@@ -319,22 +387,32 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="interface to bind; 0.0.0.0 to serve beyond this machine (a container, a VM behind a proxy)")
     ap.add_argument("--port", type=int, default=8008)
     a = ap.parse_args()
-    run = a.run if is_hub_id(a.run) or os.path.exists(f"{a.run}/head.pt") else a.fallback
+    run = a.run if is_hub_id(a.run) or os.path.exists(f"{a.run}/head.pt") or is_clef(a.run) else a.fallback
     if run != a.run: print(f"{a.run} not found, falling back to {run}")
     dev = default_device()
-    opts = LoadOptions.from_env()
-    if dev == "mps" and opts.attn is None: opts = replace(opts, attn="sdpa")   # serving default on Apple GPUs (parity measured)
-    if dev != "cpu" and opts.dtype is None: opts = replace(opts, dtype=torch.bfloat16)   # serving default: 2-4.5x faster than fp32 on an L4, same answers (LoadOptions.dtype); KEV_DTYPE=fp32 for the exact path
-    if dev == "cuda" and opts.cuda_graphs is None: opts = replace(opts, cuda_graphs=True)   # serving default: a pass is ~2,000 kernel launches, so replaying graphs cuts warm latency several-fold (kev.cuda_graphs); KEV_CUDA_GRAPHS=0 to decline
-    fused_default = dev == "cuda" and opts.fused is None
-    if fused_default: opts = replace(opts, fused=fused_available())   # serving default: fused Qwen3.5 kernels, ~1/3 less GPU time per batch (kev.fused_qwen35), when fla is installed; KEV_FUSED=0 to decline, KEV_FUSED=1 to insist
-    if opts.backend is None: opts = replace(opts, backend="auto")   # serving default: MLX for the hybrid Qwen3.5 checkpoints on Apple Silicon (LoadOptions.backend); KEV_BACKEND=torch to decline
-    ck = Checkpoint(run)
-    tok, model = ck.load(dev, opts)
-    if fused_default and not opts.fused and model.hybrid: print("fused Qwen3.5 kernels off: install the flash-linear-attention version kev/fused_qwen35.py pins (FLA_VERSION) to turn them on")
-    app.state.server = Server(ck, tok, model, dev)
-    print(f"serving {ck.requested} ({ck.path}) on {dev} via {model.backend} ({model.dtype}) {a.host}:{a.port}; states over {SERVE_MAX_STATE:,} tokens "
-          f"{'truncated (KEV_TRUNCATE_STATES=1)' if app.state.server.truncate_states else 'refused (422)'}")   # /v1/models reports the run as given, not the resolved cache path
+
+    if is_clef(run):
+        opts = LoadOptions.from_env()
+        dtype = opts.dtype or torch.bfloat16
+        print(f"clef checkpoint detected; loading {run} on {dev} ({dtype})")
+        clef_model, processor = load_clef_checkpoint(run, dev, dtype)
+        app.state.server = ClefServer(clef_model, processor, run, dev, _file_release_date(run))
+        print(f"serving clef {run} on {dev} {a.host}:{a.port}")
+    else:
+        opts = LoadOptions.from_env()
+        if dev == "mps" and opts.attn is None: opts = replace(opts, attn="sdpa")   # serving default on Apple GPUs (parity measured)
+        if dev != "cpu" and opts.dtype is None: opts = replace(opts, dtype=torch.bfloat16)   # serving default: 2-4.5x faster than fp32 on an L4, same answers (LoadOptions.dtype); KEV_DTYPE=fp32 for the exact path
+        if dev == "cuda" and opts.cuda_graphs is None: opts = replace(opts, cuda_graphs=True)   # serving default: a pass is ~2,000 kernel launches, so replaying graphs cuts warm latency several-fold (kev.cuda_graphs); KEV_CUDA_GRAPHS=0 to decline
+        fused_default = dev == "cuda" and opts.fused is None
+        if fused_default: opts = replace(opts, fused=fused_available())   # serving default: fused Qwen3.5 kernels, ~1/3 less GPU time per batch (kev.fused_qwen35), when fla is installed; KEV_FUSED=0 to decline, KEV_FUSED=1 to insist
+        if opts.backend is None: opts = replace(opts, backend="auto")   # serving default: MLX for the hybrid Qwen3.5 checkpoints on Apple Silicon (LoadOptions.backend); KEV_BACKEND=torch to decline
+        ck = Checkpoint(run)
+        tok, model = ck.load(dev, opts)
+        if fused_default and not opts.fused and model.hybrid: print("fused Qwen3.5 kernels off: install the flash-linear-attention version kev/fused_qwen35.py pins (FLA_VERSION) to turn them on")
+        app.state.server = Server(ck, tok, model, dev)
+        print(f"serving {ck.requested} ({ck.path}) on {dev} via {model.backend} ({model.dtype}) {a.host}:{a.port}; states over {SERVE_MAX_STATE:,} tokens "
+              f"{'truncated (KEV_TRUNCATE_STATES=1)' if app.state.server.truncate_states else 'refused (422)'}")   # /v1/models reports the run as given, not the resolved cache path
+
     import uvicorn
     uvicorn.run(app, host=a.host, port=a.port)
 

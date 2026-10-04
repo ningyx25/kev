@@ -72,16 +72,25 @@ def _toks(tokenizer: Any, text: str) -> list[int]:
     return tokenizer(text, add_special_tokens=False).input_ids
 
 
-def _question_options(question: dict[str, Any]) -> list[tuple[str, Any]]:
+def _question_options(question: dict[str, Any],
+                      max_option_chars: int | None = None) -> list[tuple[str, Any]]:
+    """(option_id, description) pairs in the encoder's order. max_option_chars truncates each
+    description: tap_target-style records put raw screen text in an option label, and one such
+    30k-char dump makes the schema alone exceed max_length (a 8-option record needed 38k tokens).
+    Only 0.05% of options are over 256 chars, so the cap is invisible on normal data."""
+    def cut(v: Any) -> Any:
+        if max_option_chars and isinstance(v, str) and len(v) > max_option_chars:
+            return v[:max_option_chars]
+        return v
     qtype = str(question["type"])
     if qtype == "noul":
         defaults = {"true": "The proposition is true or the answer is yes.",
                     "false": "The proposition is false or the answer is no."}
         defaults.update(question.get("criteria") or {})
-        return [(k, defaults[k]) for k in ("true", "false")]
+        return [(k, cut(defaults[k])) for k in ("true", "false")]
     if qtype == "choice":
-        return sorted((str(k), v) for k, v in question["criteria"].items())
-    return [(str(i), v) for i, v in enumerate(question["criteria"])]
+        return sorted((str(k), cut(v)) for k, v in question["criteria"].items())
+    return [(str(i), cut(v)) for i, v in enumerate(question["criteria"])]
 
 
 def _encode_media(processor: Any, record: dict[str, Any],
@@ -143,8 +152,13 @@ def _encode_media(processor: Any, record: dict[str, Any],
 
 def encode_record(tokenizer: Any, record: dict[str, Any],
                   max_length: int = 16384, max_state_tokens: int | None = None,
-                  processor: Any | None = None) -> EncodedRecord:
-    """Encode one labelled request as a clef prompt with span offsets for the head."""
+                  processor: Any | None = None,
+                  max_option_chars: int | None = 256) -> EncodedRecord:
+    """Encode one labelled request as a clef prompt with span offsets for the head.
+
+    max_option_chars truncates each option description (see _question_options): the schema is kept
+    whole and the state right-truncated, so an untruncated pathological description would raise
+    (the schema alone would not fit)."""
     schema_ids: list[int] = _toks(tokenizer, "\n\nSCHEMA FIELDS:\n")
     questions: list[EncodedQuestion] = []
     for q_idx, (qid, question) in enumerate(record["questions"].items()):
@@ -157,7 +171,7 @@ def encode_record(tokenizer: Any, record: dict[str, Any],
         schema_ids.extend(_toks(tokenizer, "\nALLOWED OPTIONS:\n"))
         option_spans: list[tuple[int, int]] = []
         option_ids:   list[str]             = []
-        for o_idx, (oid, desc) in enumerate(_question_options(question)):
+        for o_idx, (oid, desc) in enumerate(_question_options(question, max_option_chars)):
             schema_ids.extend(_toks(tokenizer, f"OPTION {o_idx + 1}: "))
             o_start = len(schema_ids)
             semantics: dict[str, Any] = {"option_id": oid}
@@ -378,7 +392,7 @@ class ClefDecisionModel(nn.Module):
     def __init__(self, name: str, tok, device, lora: int | None = None,
                  head_config: dict | None = None, dtype=torch.float32,
                  direct_load: bool = False, weights: str | None = None,
-                 processor=None):
+                 processor=None, max_option_chars: int | None = 256):
         super().__init__()
         from transformers import AutoConfig
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
@@ -413,6 +427,7 @@ class ClefDecisionModel(nn.Module):
         self.device  = device
         self.hybrid  = True   # Qwen3.5 is always hybrid (GatedDeltaNet)
         self._pad_id = _pad_id(tok)
+        self.max_option_chars = max_option_chars   # cap on option-description length (see encode_record)
         # always use AutoProcessor (handles text + image); the caller may pass an image-only
         # Qwen2VLImageProcessor which lacks the tokenizer half needed by _encode_media
         if processor is not None and hasattr(processor, "tokenizer"):
@@ -430,12 +445,14 @@ class ClefDecisionModel(nn.Module):
     def encode(self, tok, rec: dict, max_state: int = 8192, max_branch: int = 0,
                strict: bool = False, option_isolation: bool = False,
                processor=None, image_paths: list[str] | None = None,
-               max_pixels_caps=None) -> EncodedRecord:
+               max_pixels_caps=None, max_option_chars: int | None = None) -> EncodedRecord:
         """Encode a kev internal record as an EncodedRecord for forward_batch.
 
         image_paths: list of absolute paths (history-then-current order, may be empty).
         max_pixels_caps: int or list[int] per image — pixels cap before PIL resize.
-        """
+        max_option_chars: option-description cap (None = the model's self.max_option_chars)."""
+        if max_option_chars is None:
+            max_option_chars = self.max_option_chars
         from PIL import Image as PILImage
 
         proc = processor or self._processor
@@ -480,7 +497,8 @@ class ClefDecisionModel(nn.Module):
             rec_dict["images"] = imgs
 
         return encode_record(tok, rec_dict, max_length=max_state + 4096,
-                             max_state_tokens=max_state, processor=proc)
+                             max_state_tokens=max_state, processor=proc,
+                             max_option_chars=max_option_chars)
 
     def forward_batch(self, encs: list[EncodedRecord],
                       shared_prefix: bool = False) -> list[list[torch.Tensor]]:
@@ -563,3 +581,79 @@ def load_clef_head(model: ClefDecisionModel, path: str):
     from safetensors.torch import load_file
     state = load_file(str(Path(path) / "joint_head.safetensors"), device="cpu")
     model.head.load_state_dict(state, strict=True)
+
+
+# ── serve / eval convenience wrappers ────────────────────────────────────────
+
+# Alias used by kev.serve (which imports `is_clef`).
+is_clef = is_clef_checkpoint
+
+
+def load_clef_checkpoint(
+    path: str,
+    device: str,
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[ClefDecisionModel, Any]:
+    """Load a clef-flash checkpoint directory -> (ClefDecisionModel eval, processor).
+
+    The backbone (Qwen3_5ForConditionalGeneration) is loaded from the checkpoint directory
+    itself (full weights); the JointSchemaHead is loaded via load_clef_head()."""
+    from transformers import AutoProcessor
+    p = Path(path)
+    head_cfg = json.loads((p / "joint_head_config.json").read_text())
+    head_cfg.pop("hidden_size", None)   # stored in config file but ClefDecisionModel reads it from backbone
+    tok = load_tokenizer(str(p))
+    processor = AutoProcessor.from_pretrained(str(p), local_files_only=True)
+    model = ClefDecisionModel(str(p), tok, device, head_config=head_cfg,
+                              dtype=dtype, direct_load=True, weights=str(p),
+                              processor=processor)
+    load_clef_head(model, str(p))
+    model.head.to(device=device, dtype=dtype)   # safetensors loads as fp32; cast to match backbone
+    return model.eval(), processor
+
+
+def _systemone_answer(question: dict[str, Any], probabilities: dict[str, float]) -> dict[str, Any]:
+    """Convert per-option probabilities for one question into a TypeSafe answer dict."""
+    qtype = question["type"]
+    if qtype == "noul":
+        return {"type": "noul", "noul": round(probabilities.get("true", 0.0), 4)}
+    if qtype == "choice":
+        options = [str(o) for o in question["criteria"]]
+        choice = max(options, key=lambda o: probabilities.get(o, 0.0))
+        return {"type": "choice", "choice": choice,
+                "confidence": round(probabilities.get(choice, 0.0), 4),
+                "probabilities": {o: round(probabilities.get(o, 0.0), 4) for o in options}}
+    # score
+    levels = [str(i) for i in range(len(question["criteria"]))]
+    return {"type": "score",
+            "score": round(sum(i * probabilities.get(lv, 0.0) for i, lv in enumerate(levels)), 4),
+            "confidence": round(max(probabilities.get(lv, 0.0) for lv in levels), 4),
+            "legend": dict(zip(levels, question["criteria"])),
+            "probabilities": {lv: round(probabilities.get(lv, 0.0), 4) for lv in levels}}
+
+
+@torch.no_grad()
+def systemone(model: ClefDecisionModel, processor: Any, request: dict[str, Any],
+              max_length: int = 16384) -> dict[str, Any]:
+    """Answer a TypeSafe /v1/systemone request dict with a TypeSafe response dict.
+
+    Images in request['images'] must be PIL Images (already decoded from base64 by kev.serve).
+    """
+    questions = request.get("questions")
+    r: dict[str, Any] = {"state": request["state"], "questions": questions}
+    imgs = request.get("images")
+    if imgs:
+        r["images"] = imgs
+    tok = processor.tokenizer
+    enc = encode_record(tok, r, max_length=max_length, processor=processor if imgs else None)
+    dev = next(model.parameters()).device
+    logits = model.forward_batch([enc])[0]
+    answers = {
+        q.question_id: _systemone_answer(
+            questions[q.question_id],
+            dict(zip(q.option_ids, ql.float().softmax(-1).tolist())),
+        )
+        for q, ql in zip(enc.questions, logits)
+    }
+    return {"model": request.get("model", "clef"), "answers": answers,
+            "usage": {"input_tokens": len(enc.input_ids), "output_tokens": 0}}

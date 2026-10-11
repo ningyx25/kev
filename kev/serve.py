@@ -10,6 +10,12 @@ date preprocessing (api.with_date_facts). A state over kev.model.SERVE_MAX_STATE
 KEV_TRUNCATE_STATES=1 reads its first SERVE_MAX_STATE tokens instead, and then every response says whether it did. Backend
 and precision follow LoadOptions (KEV_BACKEND, KEV_DTYPE, ...): on Apple Silicon the hybrid Qwen3.5 checkpoints run on MLX
 by default, elsewhere on torch in bf16.
+
+A GUI-Actor checkpoint (a directory whose weights carry the vendored pointer head, kev.gui_actor_model) is served by
+GUIActorServer instead: the request's state is the system prompt, each question's instructions the user instruction,
+images[-1] the screenshot to ground on, and every choice question is answered with the pointer head's per-patch
+distribution (keys are patch indices; n_width/n_height/patch_pixels in the answer decode them). KEV_GUI_ACTOR_TOPK sizes
+the region points it also returns (0 leaves just the distribution); one grounding pass per choice question.
 """
 import argparse, asyncio, atexit, hmac, os, queue, random, sys, threading, time, traceback, uuid
 from concurrent.futures import Future
@@ -23,6 +29,8 @@ from .api import SystemOneRequest, to_record, to_answers, output_tokens, with_da
 from .checkpoint import Checkpoint, LoadOptions, fused_available, is_hub_id
 from .clef_model import is_clef, load_clef_checkpoint, systemone as clef_systemone
 from .device import default_device, empty_cache, out_of_memory, sync
+from .gui_actor_model import get_merged_token_pixels, is_gui_actor, load_gui_actor_checkpoint
+from .gui_actor_model import systemone as gui_actor_systemone
 from .model import SERVE_MAX_STATE, ContextOverflow, admit
 
 PREFIX_CACHE_SIZE = int(os.environ.get("KEV_PREFIX_CACHE", "4"))          # states kept (KV + DeltaNet states; attention-only backbones also the state's hidden states); 0 disables
@@ -32,6 +40,7 @@ PREFIX_MAX_TOKENS = int(os.environ.get("KEV_PREFIX_MAX_TOKENS", "65536"))  # sta
 DATE_FACTS = os.environ.get("KEV_DATE_FACTS", "0") == "1"
 TRUNCATE_STATES = os.environ.get("KEV_TRUNCATE_STATES", "0") == "1"    # unset = a state over SERVE_MAX_STATE tokens gets a 422; 1 = read its first SERVE_MAX_STATE tokens, and every response says whether it did (truncated, usage.state_tokens / state_tokens_used)
 API_KEY = os.environ.get("KEV_API_KEY")                                  # unset = open server; set = require Authorization: Bearer <key>, as the TypeSafe clients always send
+GUI_ACTOR_TOPK = int(os.environ.get("KEV_GUI_ACTOR_TOPK", "5"))          # region points a GUI-Actor answer carries (0 = the per-patch distribution only)
 MAX_BATCH = 64                                                           # requests the model thread takes at once (kev.cuda_graphs splits them to fit its buffers)
 MODEL_NAMES = ("kev-latest", "jev-latest")                               # both names serve this checkpoint; jev-latest is the TypeSafe SDK default model, so an unconfigured client works
 
@@ -99,6 +108,7 @@ class Server:
     runs it as one batch (model.probs_batch: with CUDA graphs, shared state and row passes; otherwise one request at a
     time), then answers each request. It also captures pending CUDA graphs when the graphs say so (capture_due). `lock` is
     held around each batch and capture: hold it to use the model directly."""
+    kind = "kev"   # which family answers; the /v1/models card and the demo endpoints' guards read it
     checkpoint: Checkpoint
     tok: object
     model: object
@@ -241,6 +251,7 @@ class ClefServer:
     FastAPI endpoint functions work without branching. Requests are serialised
     through a lock (no queue/thread needed: the model does a single blocking
     forward pass per request)."""
+    kind = "clef"
     model: object
     processor: object
     requested: str         # checkpoint path as given on the command line
@@ -271,6 +282,48 @@ class ClefServer:
         return await loop.run_in_executor(None, self.answer, req)
 
 
+@dataclass
+class GUIActorServer:
+    """Serving wrapper for a GUI-Actor checkpoint (pointer head on a Qwen2.5-VL / Qwen3.5 backbone).
+
+    Same answer() / answer_async() surface as Server and ClefServer so the FastAPI endpoint functions
+    work without branching. Requests are serialised through a lock: every grounding pass is batch=1
+    and blocking (about 1-3 s for the 3B/4B/7B on one GPU, kev.gui_actor_model)."""
+    kind = "gui_actor"
+    model: object
+    processor: object
+    requested: str         # checkpoint path as given on the command line
+    device: str
+    release_date: str
+    model_type: str        # transformers model_type ("qwen2_5_vl" / "qwen3_5")
+    patch_pixels: int      # pixels one merged visual token covers (28 for Qwen2.x, 32 for Qwen3.x)
+    topk: int = GUI_ACTOR_TOPK
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def close(self):
+        pass   # no background thread
+
+    def wait_idle(self):
+        pass   # no queue
+
+    def answer(self, req):
+        t = time.time()
+        d = prepare(req).model_dump()
+        if d.get("images"):
+            d["images"] = _decode_images(d["images"])
+        with self.lock:
+            try:
+                resp = gui_actor_systemone(self.model, self.processor, d, self.model_type, topk=self.topk)
+            except ValueError as e:   # no image, or a question type this server does not answer
+                raise HTTPException(422, str(e))
+        resp["latency_ms"] = round((time.time() - t) * 1000, 1)
+        return resp
+
+    async def answer_async(self, req):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.answer, req)
+
+
 def prepare(req):
     """Opt-in preprocessing applied to every request before the model sees it."""
     return req.model_copy(update={"state": with_date_facts(req.state)}) if DATE_FACTS else req
@@ -293,7 +346,7 @@ async def typesafe(request, call_next):
     return resp
 
 
-def server() -> "Server | ClefServer":
+def server() -> "Server | ClefServer | GUIActorServer":
     return app.state.server
 
 
@@ -313,6 +366,7 @@ class PermuteSystemOne(BaseModel):
 @app.post("/v1/systemone/permute")
 def systemone_permute(r: PermuteSystemOne):
     """Re-run one Choice question under n_perm option orders. Returns per-order probabilities keyed by option name."""
+    if getattr(server(), "kind", "kev") != "kev": raise HTTPException(422, "option-order permutation is a kev decision-model endpoint")
     q = r.request.questions.get(r.question)
     if q is None or q.type != "choice": raise HTTPException(422, "question must be an existing choice question")
     rng = random.Random(r.seed); keys = list(q.criteria); runs = []
@@ -330,6 +384,7 @@ def systemone_permute(r: PermuteSystemOne):
 def systemone_separate(req: SystemOneRequest):
     """Answer each question in its own request against the same state (N passes). For packed-vs-separate comparison."""
     s = server()
+    if getattr(s, "kind", "kev") != "kev": raise HTTPException(422, "packed-vs-separate is a kev decision-model endpoint")
     parts = [s.answer(req.model_copy(update={"questions": {qid: q}})) for qid, q in req.questions.items()]
     answers = {qid: a for p in parts for qid, a in p["answers"].items()}
     tok = getattr(s, "tok", None)
@@ -352,15 +407,21 @@ def truncation_marks(body, part):
 @app.get("/v1/models")
 def models():
     """One TypeSafe model card (name, description, release_date) per accepted model name, plus serving details
-    a client may ignore. For clef checkpoints only the essential fields are returned."""
+    a client may ignore. `kind` says which family answers: kev / clef / gui_actor. For clef and GUI-Actor
+    checkpoints only the essential fields are returned."""
     s = server()
+    if isinstance(s, GUIActorServer):
+        card = {"description": f"GUI-Actor pointer head on {s.model_type}, serving {s.requested}",
+                "release_date": s.release_date, "run": s.requested, "device": s.device, "kind": s.kind,
+                "model_type": s.model_type, "patch_pixels": s.patch_pixels, "topk": s.topk}
+        return {"models": [{"name": name, **card} for name in MODEL_NAMES]}
     if isinstance(s, ClefServer):
         card = {"description": f"Clef joint-schema head on Qwen3.5, serving {s.requested}",
-                "release_date": s.release_date, "run": s.requested, "device": s.device}
+                "release_date": s.release_date, "run": s.requested, "device": s.device, "kind": s.kind}
         return {"models": [{"name": name, **card} for name in MODEL_NAMES]}
     ck, meta = s.checkpoint, s.checkpoint.meta
     card = {"description": f"Kev pointer head on {meta.base}, serving {ck.requested} at temperature {s.model.head.temperature:.2f}",
-            "release_date": s.release_date,
+            "release_date": s.release_date, "kind": s.kind,
             "run": ck.requested, "base": meta.base, "lora": meta.lora, "device": s.device, "backend": s.model.backend, "dtype": s.model.dtype,
             "temperature": s.model.head.temperature, "max_state_tokens": SERVE_MAX_STATE, "truncate_states": s.truncate_states,
             "cuda_graphs": graphs.stats() if (graphs := getattr(s.model, "graphs", None)) else None,
@@ -387,11 +448,20 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="interface to bind; 0.0.0.0 to serve beyond this machine (a container, a VM behind a proxy)")
     ap.add_argument("--port", type=int, default=8008)
     a = ap.parse_args()
-    run = a.run if is_hub_id(a.run) or os.path.exists(f"{a.run}/head.pt") or is_clef(a.run) else a.fallback
+    run = a.run if is_hub_id(a.run) or os.path.exists(f"{a.run}/head.pt") or is_clef(a.run) or is_gui_actor(a.run) else a.fallback
     if run != a.run: print(f"{a.run} not found, falling back to {run}")
     dev = default_device()
 
-    if is_clef(run):
+    if is_gui_actor(run):
+        opts = LoadOptions.from_env()
+        dtype = opts.dtype or torch.bfloat16
+        print(f"gui-actor checkpoint detected; loading {run} on {dev} ({dtype})")
+        model, processor, model_type = load_gui_actor_checkpoint(run, dev, dtype, opts.attn)
+        app.state.server = GUIActorServer(model, processor, run, dev, _file_release_date(run), model_type,
+                                          get_merged_token_pixels(model_type), GUI_ACTOR_TOPK)
+        print(f"serving gui-actor {run} ({model_type}) on {dev} {a.host}:{a.port}; choice questions answered with the "
+              f"per-patch pointer distribution, region points topk={GUI_ACTOR_TOPK}")
+    elif is_clef(run):
         opts = LoadOptions.from_env()
         dtype = opts.dtype or torch.bfloat16
         print(f"clef checkpoint detected; loading {run} on {dev} ({dtype})")

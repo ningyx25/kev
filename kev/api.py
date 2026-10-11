@@ -44,7 +44,7 @@ class SystemOneRequest(BaseModel):
     state: JSONContent
     model: str = "kev-latest"
     questions: dict[str, Question] = Field(min_length=1)
-    images: list[str] | None = None   # base64-encoded images (raw or data-URI: "data:image/jpeg;base64,..."); clef checkpoints only
+    images: list[str] | None = None   # base64-encoded images (raw or data-URI: "data:image/jpeg;base64,..."); clef and GUI-Actor checkpoints only
 
 
 def render(v: JSONContent, indent: int = 0) -> str:
@@ -141,10 +141,12 @@ def score_confidence(p: list[float]) -> float:
     return max(0.0, 1.0 - sum(pi * abs(i - mode) for i, pi in enumerate(p)) / D)
 
 
-def round_prob(x: float) -> float:
+def round_prob(x: float, decimals: int = 4) -> float:
     """Serialization precision for probabilities and derived scalars. 4 decimals keeps the sum of a rounded distribution
-    within TypeSafe's tolerance (|sum - 1| < 0.02) at the 255-option maximum: 255 * 0.00005 < 0.02."""
-    return round(float(x), 4)
+    within TypeSafe's tolerance (|sum - 1| < 0.02) at the 255-option maximum: 255 * 0.00005 < 0.02. A distribution with
+    more keys than that needs more decimals: the GUI-Actor patch answers (kev.gui_actor_model) round to 6, because a
+    2,550-patch grid at 4 decimals can drift the sum by up to 0.13."""
+    return round(float(x), decimals)
 
 
 def to_answers(probs: list[list[float]], meta: list[dict]) -> dict[str, Any]:

@@ -127,6 +127,19 @@ def card():
     return httpx.get(f"{BASE}/v1/models", timeout=30).json()["models"][0]
 
 
+@pytest.fixture(scope="module", autouse=True)
+def kev_checkpoint_server():
+    """This file is the kev decision-model conformance suite (max_state_tokens, truncate_states, option-name
+    answers). A clef or GUI-Actor server at KEV_BASE_URL answers none of it, so skip rather than fail; an
+    unreachable server keeps failing as before (the file is run with a server up)."""
+    try:
+        kind = card().get("kind")
+    except Exception:
+        return
+    if kind != "kev":
+        pytest.skip(f"the server at {BASE} serves {kind!r}, not a kev checkpoint")
+
+
 def over_length():
     """A request whose state is past the server's limit (/v1/models max_state_tokens): every word is at least one token."""
     return {"state": "word " * (card()["max_state_tokens"] + 16), "model": "kev-latest",

@@ -3,18 +3,20 @@ import math
 import pytest
 from pydantic import ValidationError
 
-from kev_serve.api import (Box, BoxAnswer, Choice, Noul, Score, SystemOneRequest,
-                           choice_confidence, score_confidence, to_answers, to_record)
+from kev_serve.api import (Box, BoxAnswer, Choice, Ground, GroundAnswer, Noul, Score,
+                           SystemOneRequest, choice_confidence, score_confidence, to_answers, to_record)
 
 
-def test_question_union_accepts_all_four():
+def test_question_union_accepts_all_five():
     req = SystemOneRequest(state="s", questions={
         "n": {"type": "noul", "instructions": "is it?"},
         "c": {"type": "choice", "instructions": "pick", "criteria": {"a": "A", "b": "B"}},
         "s": {"type": "score", "instructions": "rate", "criteria": ["low", "high"]},
         "b": {"type": "box", "instructions": "the mug in `photo`"},
+        "g": {"type": "ground", "instructions": "the mug in `photo`"},
     })
     assert isinstance(req.questions["b"], Box)
+    assert isinstance(req.questions["g"], Ground)
     assert req.questions["n"].type == "noul"
 
 
@@ -35,10 +37,27 @@ def test_box_answer_edge_constraints():
         BoxAnswer(box={"top": 0.1, "bottom": 0.5, "left": 0.1}, confidence=0.5)
 
 
-def test_to_record_rejects_box():
-    req = SystemOneRequest(state="s", questions={"b": {"type": "box", "instructions": "x"}})
+def test_to_record_rejects_box_and_ground():
+    req = SystemOneRequest(state="s", questions={"b": {"type": "box", "instructions": "x"},
+                                                 "g": {"type": "ground", "instructions": "x"}})
     with pytest.raises(ValueError, match="box"):
         to_record(req)
+    req = SystemOneRequest(state="s", questions={"g": {"type": "ground", "instructions": "x"}})
+    with pytest.raises(ValueError, match="ground"):
+        to_record(req)
+
+
+def test_ground_answer_constraints():
+    ok = GroundAnswer(point=(500, 250), confidence=0.8, topk_points=[(100, 100), (900, 900)])
+    assert ok.point == (500, 250)
+    with pytest.raises(ValidationError):   # out of 0-999
+        GroundAnswer(point=(1000, 0), confidence=0.5)
+    with pytest.raises(ValidationError):   # negative
+        GroundAnswer(point=(-1, 0), confidence=0.5)
+    with pytest.raises(ValidationError):   # bad confidence
+        GroundAnswer(point=(0, 0), confidence=1.5)
+    with pytest.raises(ValidationError):   # ground needs instructions
+        Ground(type="ground", instructions="  ")
 
 
 def test_to_answers_shapes():

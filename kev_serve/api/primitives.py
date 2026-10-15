@@ -5,6 +5,8 @@ Choice -> options 'name' or 'name: desc';      answer = argmax, probabilities by
 Score  -> options = ordered level descriptions; answer = expected level, legend, probabilities by index
 Box    -> instructions name a target in an image asset; answer = {top, bottom, left, right} in [0, 1] + confidence
          (schema served; a backend must register for box before it is answered, else the HTTP layer returns 501)
+Ground -> instructions name a target in an image; answer = the click point [x, y] normalised to 0-999 integers
+         + confidence (the GUI-Actor pointer head's connected-region centre)
 """
 from typing import Literal, Union
 from pydantic import BaseModel, Field, model_validator
@@ -49,8 +51,20 @@ class Box(BaseModel):
         return self
 
 
-Question = Union[Noul, Choice, Score, Box]
-QUESTION_TYPES = ("noul", "choice", "score", "box")
+class Ground(BaseModel):
+    """A Ground locates something in an image as a click point. No criteria; the instructions name the
+    target and the image. Answer coordinates are 0-999 integers (the Qwen-VL grounding convention)."""
+    type: Literal["ground"]
+    instructions: str
+
+    @model_validator(mode="after")
+    def _check(self):
+        if not self.instructions or not self.instructions.strip(): raise ValueError("ground instructions must name the target")
+        return self
+
+
+Question = Union[Noul, Choice, Score, Box, Ground]
+QUESTION_TYPES = ("noul", "choice", "score", "box", "ground")
 
 
 class Asset(BaseModel):
@@ -76,4 +90,22 @@ class BoxAnswer(BaseModel):
         if not e["left"] < e["right"]: raise ValueError("left must be < right")
         if not e["top"] < e["bottom"]: raise ValueError("top must be < bottom")
         if not 0.0 <= self.confidence <= 1.0: raise ValueError("confidence must be in [0, 1]")
+        return self
+
+
+class GroundAnswer(BaseModel):
+    """The click point as [x, y], each 0-999 integers (x across the width, y down the height,
+    top-left origin), plus the region confidence. topk_points: alternative region centres,
+    same scale, optional."""
+    type: Literal["ground"] = "ground"
+    point: tuple[int, int]
+    confidence: float
+    topk_points: list[tuple[int, int]] | None = None
+
+    @model_validator(mode="after")
+    def _check(self):
+        if not (0 <= self.point[0] <= 999 and 0 <= self.point[1] <= 999): raise ValueError("point coordinates must be 0-999")
+        if not 0.0 <= self.confidence <= 1.0: raise ValueError("confidence must be in [0, 1]")
+        for p in self.topk_points or []:
+            if not (0 <= p[0] <= 999 and 0 <= p[1] <= 999): raise ValueError("topk_points coordinates must be 0-999")
         return self

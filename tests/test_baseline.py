@@ -50,3 +50,22 @@ def test_forward_baseline():
     p = resp["answers"]["hot"]["noul"]
     assert 0.0 <= p <= 1.0
     print(f"baseline noul(hot tea) = {p}")   # record this value when pinning; compare on change
+
+
+def test_ground_decode_999():
+    """The connected-region decode and the 0-999 conversion (no checkpoint, no GPU)."""
+    import torch
+    from kev_serve.backends.gui_actor.gui_actor_model import _to_999, get_prediction_region_point
+    # a 4x4 grid of patches; one 2x2 hot block at (y=1..2, x=1..2), rest near zero
+    n_width = n_height = 4
+    scores = torch.full((1, n_width * n_height), 0.01)
+    for y in (1, 2):
+        for x in (1, 2):
+            scores[0, y * n_width + x] = 1.0
+    point, centers, values, *_ = get_prediction_region_point(scores, n_width, n_height,
+                                                             return_all_regions=True, rect_center=False)
+    # patch centres at rows/cols 1 and 2 are 0.375 and 0.625; the 2x2 block's weighted centre is 0.5
+    assert abs(point[0] - 0.5) < 1e-6 and abs(point[1] - 0.5) < 1e-6
+    assert _to_999(point[0], point[1]) == (500, 500)
+    assert _to_999(0.0, 1.0) == (0, 999)
+    assert _to_999(-0.5, 1.5) == (0, 999)   # clamped

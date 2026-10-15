@@ -1,0 +1,60 @@
+"""GuiActorBackend: serving wrapper around the vendored GUI-Actor pointer head.
+
+Images arrive decoded (PIL) in req_dict["images"]; the HTTP layer does base64 / assets handling.
+Requests run on the engine (SyncLockEngine): every grounding pass is blocking, batch=1."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from ..base import Backend
+from ...engine import SyncLockEngine
+
+SUPPORTED_PRIMITIVES = frozenset({"ground"})
+TOPK = 5   # alternative region centres a ground answer carries (0 = the point and confidence only)
+
+
+def file_release_date(path: str) -> str:
+    """ISO date from the newest file mtime in `path` (local checkpoints without a Hub commit date)."""
+    import datetime
+    MTIME_FLOOR = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc).timestamp()
+    files = sorted((p.stat().st_mtime for p in Path(path).iterdir() if p.is_file()), reverse=True)
+    stamp = next((t for t in files if t >= MTIME_FLOOR), None)
+    return "unknown" if stamp is None else datetime.datetime.fromtimestamp(stamp, datetime.timezone.utc).date().isoformat()
+
+
+class GuiActorBackend:
+    kind = "gui_actor"
+    supported_primitives = SUPPORTED_PRIMITIVES
+
+    def __init__(self, model, processor, requested: str, device: str, model_type: str,
+                 topk: int = TOPK, engine: SyncLockEngine | None = None):
+        self.model, self.processor = model, processor
+        self.requested, self.device = requested, device
+        self.model_type = model_type            # transformers model_type (qwen2_5_vl / qwen3_vl / qwen3_5 / ...)
+        self.topk = topk
+        self.release_date = file_release_date(requested)
+        self.engine = engine or SyncLockEngine()
+
+    def answer(self, req_dict: dict[str, Any]) -> dict[str, Any]:
+        from .gui_actor_model import systemone as gui_actor_systemone
+        try:
+            return gui_actor_systemone(self.model, self.processor, req_dict, self.model_type, topk=self.topk)
+        except ValueError as e:   # no image, or a question type this backend does not answer
+            from fastapi import HTTPException
+            raise HTTPException(422, str(e))
+
+    def answer_box(self, instructions: str, images: list):
+        """Box is not implemented by this backend (its per-patch distribution gives a point /
+        region, not calibrated edges); a future head may override this."""
+        raise NotImplementedError("gui_actor answers ground, not box")
+
+    def model_card(self) -> dict[str, Any]:
+        from .gui_actor_model import get_merged_token_pixels
+        return {"description": f"GUI-Actor pointer head on {self.model_type}, serving {self.requested}",
+                "supported_primitives": sorted(self.supported_primitives),
+                "model_type": self.model_type, "patch_pixels": get_merged_token_pixels(self.model_type),
+                "topk": self.topk}
+
+    def close(self) -> None:
+        self.engine.close()

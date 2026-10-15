@@ -13,7 +13,7 @@ async def images_gate(request: Request, call_next):
             and request.headers.get(IMAGES_HEADER) != "true"):
         body = await request.json()
         has_images = bool(body.get("assets") or body.get("images")
-                          or any(q.get("type") == "box" for q in (body.get("questions") or {}).values()))
+                          or any(q.get("type") in ("box", "ground") for q in (body.get("questions") or {}).values()))
         if has_images:
             return JSONResponse({"detail": f"requests with images or box questions need the header {IMAGES_HEADER}: true"}, 422)
     return await call_next(request)

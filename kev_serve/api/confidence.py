@@ -68,10 +68,10 @@ def question_keys(qtype: str, criteria) -> list[str]:
 
 def to_record(req: SystemOneRequest):
     """-> internal record for encode(), plus per-question metadata ({"id", "type", "keys", "legend" for score}) to map
-    probabilities back. Box questions are not encodable (no options); the caller filters them out first."""
+    probabilities back. Box and ground questions are not encodable (no options); the caller filters them out first."""
     qs, meta = [], []
     for qid, q in req.questions.items():
-        if q.type == "box": raise ValueError(f"question {qid!r}: box questions cannot be encoded (no options)")
+        if q.type in ("box", "ground"): raise ValueError(f"question {qid!r}: {q.type} questions cannot be encoded (no options)")
         m = {"id": qid, "type": q.type, "keys": question_keys(q.type, q.criteria)}
         if q.type == "noul":
             c = q.criteria or {}

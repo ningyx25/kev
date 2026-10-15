@@ -11,6 +11,7 @@ monorepo onto an orphan branch: no shared history, no `kev` package dependency.
 | `choice` | `{"type": "choice", "instructions", "criteria": {name: desc}}`    | `{"choice", "confidence", "probabilities"}`                                                            |
 | `score`  | `{"type": "score", "instructions", "criteria": [levels]}`         | `{"score", "legend", "probabilities", "confidence"}`                                                   |
 | `box`    | `{"type": "box", "instructions"}` (no criteria; needs an image)   | `{"box": {top, bottom, left, right}, "confidence"}` — **501 until a Box backend is registered** |
+| `ground` | `{"type": "ground", "instructions"}` (no criteria; needs an image) | `{"point": [x, y], "confidence", "topk_points"?}` — x/y are **0-999 integers**; answered by the GUI-Actor backend |
 
 Confidence formulas mirror TypeSafe's `system-one-adapter 0.2.1`. Schemas: `kev_serve/api.py`.
 
@@ -49,8 +50,15 @@ kev_serve/
 └── cli.py          # python -m kev_serve --run name=ckpt [--run name2=ckpt2 ...]
 ```
 
-Today: clef (noul / choice / score). Box is interface-only; the planned backend is GUI-Actor's
-per-patch distribution aggregated into a connected region (normalized edges).
+Today: **clef** (noul / choice / score) and **gui_actor** (ground — the vendored GUI-Actor pointer
+head's connected-region centre, 0-999; backbones qwen2_5_vl / qwen3_vl / qwen3_vl_moe / qwen3_5).
+Box is interface-only; a future head may implement `answer_box()` (normalised edges). The routing
+layer 501s any primitive a backend does not declare, so mixing backends needs no route changes.
+
+```bash
+python -m kev_serve --run main=<clef_ckpt> --run grounder=<gui_actor_ckpt> --port 8008
+# noul/choice/score -> main; ground -> grounder; the wrong primitive on either -> 501
+```
 
 **Add a backend**: a package under `kev_serve/backends/` whose `__init__.py` calls
 `register_backend(kind, sniff, factory)` with a `Backend` implementing `kind`,

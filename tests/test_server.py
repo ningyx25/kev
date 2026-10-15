@@ -98,3 +98,46 @@ def test_assets_require_images_header(client):
     assert r.status_code == 200
     sent = FakeBackend.seen[-1]
     assert sent["images"] and sent["images"][0].size == (4, 4)   # asset decoded to a PIL image
+
+
+class FakeGuiActorBackend(FakeBackend):
+    """ground-only backend, like the real gui_actor one."""
+    kind = "gui_actor"
+    supported_primitives = frozenset({"ground"})
+
+    def answer(self, d):
+        FakeBackend.seen.append(d)
+        return {"model": d.get("model", "jev-latest"),
+                "answers": {"g": {"type": "ground", "point": [512, 300], "confidence": 0.7,
+                                  "topk_points": [[512, 300], [100, 80]]}},
+                "usage": {"input_tokens": 99, "output_tokens": 0}}
+
+
+def test_gui_actor_ground_roundtrip():
+    b = FakeGuiActorBackend()
+    app = create_app(Settings(), ModelRouter({"grounder": b}, "grounder"))
+    c = TestClient(app)
+    body = {"state": "s", "questions": {"g": {"type": "ground", "instructions": "the settings icon"}},
+            "images": [_png_b64()]}
+    r = c.post("/v1/systemone", json=body)
+    assert r.status_code == 422                       # images gate: no danger-zone header
+    r = c.post("/v1/systemone", json=body, headers={"TypeSafe-Danger-Zone-Images": "true"})
+    assert r.status_code == 200
+    a = r.json()["answers"]["g"]
+    assert a["point"] == [512, 300] and a["confidence"] == 0.7
+
+
+def test_gui_actor_rejects_text_primitives():
+    b = FakeGuiActorBackend()
+    app = create_app(Settings(), ModelRouter({"grounder": b}, "grounder"))
+    c = TestClient(app)
+    r = c.post("/v1/systemone", json={"state": "s", "questions": {"n": {"type": "noul", "instructions": "?"}}})
+    assert r.status_code == 501 and "noul" in r.json()["detail"]
+
+
+def test_clef_rejects_ground(client):
+    # the fake clef backend (noul/choice/score) 501s a ground question
+    r = client.post("/v1/systemone",
+                    json={"state": "s", "questions": {"g": {"type": "ground", "instructions": "x"}}},
+                    headers={"TypeSafe-Danger-Zone-Images": "true"})
+    assert r.status_code == 501 and "ground" in r.json()["detail"]

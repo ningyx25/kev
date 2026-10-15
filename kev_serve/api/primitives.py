@@ -69,10 +69,20 @@ QUESTION_TYPES = ("noul", "choice", "score", "box", "ground")
 
 class Asset(BaseModel):
     """One image in the request's top-level `assets` map, referenced by its key wherever the image belongs
-    (docs.typesafe.ai/images)."""
+    (docs.typesafe.ai/images). The bytes arrive one of two ways: inline as `data_base64` (which needs
+    `format`), or — in the SDK's multipart body — as the part named by `part`."""
     type: Literal["image"]
-    format: str = "png"                      # jpg / png / webp ...
-    data_base64: str
+    format: str | None = None    # png / jpg / jpeg ...; required with data_base64, ignored with part
+    data_base64: str | None = None
+    part: str | None = None      # the multipart part holding the image; with part, data_base64 is ignored
+
+    @model_validator(mode="after")
+    def _check(self):
+        if (self.data_base64 is None) == (self.part is None):
+            raise ValueError("an asset carries the image either inline (data_base64) or as a multipart part (part), not both")
+        if self.data_base64 is not None and self.format is None:
+            raise ValueError("format is required with data_base64")
+        return self
 
 
 class BoxAnswer(BaseModel):

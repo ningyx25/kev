@@ -27,11 +27,14 @@ class ModelRouter:
         raise HTTPException(404, f"model {model!r} not found; served: {', '.join(self.backends) or 'none'}")
 
     def cards(self, settings) -> list[dict]:
-        """One TypeSafe model card per explicit name, plus the alias names on the default backend."""
+        """One TypeSafe model card per explicit name, plus the alias names on the default backend.
+        The engine's batching / prefix-cache counters ride along when the engine keeps any."""
         cards = []
         for name, b in self.backends.items():
+            stats = getattr(b.engine, "stats", lambda: None)() if getattr(b, "engine", None) is not None else None
             cards.append({"name": name, "release_date": b.release_date, "kind": b.kind,
-                          "run": getattr(b, "requested", None), "device": getattr(b, "device", None), **b.model_card()})
+                          "run": getattr(b, "requested", None), "device": getattr(b, "device", None),
+                          **(stats or {}), **b.model_card()})
         default_aliases = [a for a in settings.alias_models
                            if a not in self.backends and self.default in self.backends]
         if default_aliases:

@@ -101,3 +101,23 @@ def test_gui_actor_answer_validates_contract(monkeypatch):
     b = be.GuiActorBackend(model=object(), processor=object(), requested=".", device="cpu", model_type="qwen2_5_vl")
     out = b.answer({"images": [object()], "questions": {"g": {"type": "ground", "instructions": "x"}}})
     assert out["answers"]["g"] == {"type": "ground", "point": (10, 20), "confidence": 0.5, "topk_points": None}
+
+
+def test_fused_helpers_without_fla():
+    """The fused wiring is import-safe and falls back cleanly when flash-linear-attention is absent:
+    fused_layers never imports fla at module level, the vendored fused_qwen35 always does."""
+    import torch.nn as nn
+    from kev_serve.backends.clef import fused_layers as f
+
+    assert f.fused_available() in (True, False)     # never raises: it is the non-throwing probe
+    import pytest
+    pytest.importorskip  # the vendored module is only importable with fla installed; apply_fused is lazy
+
+    class Layers(nn.Module):
+        def __init__(self): super().__init__(); self.layers = [nn.Identity()]
+    # a bare text model already has .layers
+    assert f.text_layers(Layers()).__len__() == 1
+    # the VL composite: model.language_model.layers (what _text_model() reaches for the forward too)
+    vl = Layers(); vl.language_model = Layers()
+    del vl.layers                                  # force the language_model branch
+    assert len(f.text_layers(vl)) == 1

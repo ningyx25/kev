@@ -14,6 +14,7 @@ dependencies = [
     "transformers==5.17.0",
     "Pillow>=10.0",
     "safetensors",
+    "huggingface_hub>=0.25",   # --run org/name[@rev] Hub download (hub.py)
 ]
 
 [project.optional-dependencies]
@@ -31,7 +32,7 @@ mlx = [
 
 vision-kernels = [
     "causal-conv1d==1.7.0",
-    "flash-linear-attention",
+    "flash-linear-attention==0.5.2",   # the version kev_serve/backends/clef/fused_qwen35.py is pinned to (FLA_VERSION); other versions are refused
 ]
 
 [build-system]

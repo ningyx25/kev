@@ -558,10 +558,13 @@ class ClefDecisionModel(nn.Module):
     def _replicate(cache):
         """A copy of the prefix cache whose tensor state the continuation may consume: the stored prefix
         must stay pristine for the next request (kev's old rows_hidden replicated for the same reason).
-        Shallow layer copies + cloned tensors: the layers' structure is shared, their contents are not."""
+        Shallow copies down to the tensors — but the hybrid layers keep their state in *dicts*
+        (conv_states / recurrent_states indexed by slot), and those containers must be rebuilt or the
+        clone's in-place writes (copy_, update_recurrent_state) land on the stored prefix."""
         import copy as _copy
         def cloned(v):
             if isinstance(v, torch.Tensor): return v.clone()
+            if isinstance(v, dict): return {k: cloned(x) for k, x in v.items()}
             if isinstance(v, list): return [cloned(x) for x in v]
             if isinstance(v, tuple): return tuple(cloned(x) for x in v)
             return v
@@ -579,7 +582,8 @@ class ClefDecisionModel(nn.Module):
     def forward_continuation(self, enc: EncodedRecord, prefix) -> list[torch.Tensor]:
         """Per-question logits for a record whose prefix tokens equal the cached prefix's; only the
         schema runs, and the prefix hidden states are re-attached so the head sees the same full-prompt
-        layout as in a one-pass forward (spans keep their absolute coordinates)."""
+        layout as in a one-pass forward (spans keep their absolute coordinates). The prefix cache is
+        consumed through a replica: callers pass the stored prefix itself and it must not change."""
         cache, h_prefix = prefix
         p = enc.prefix_len
         dev = h_prefix.device
@@ -613,10 +617,10 @@ class ClefDecisionModel(nn.Module):
     @torch.inference_mode()
     def probs_with_prefix(self, enc: EncodedRecord, prefix, temperature: float = 1.0) -> list[list[float]]:
         """probs() for a record whose prefix tokens equal the cached prefix's (prefix is the
-        (cache, hidden) pair state_pass returned); only the schema runs."""
+        (cache, hidden) pair state_pass returned); only the schema runs — forward_continuation
+        replicates the cache itself, so a stored prefix survives any number of reuses."""
         if enc.prefix_len == 0: raise ValueError("prefix does not match this record (it has no prefix)")
-        cache, h_prefix = prefix
-        return [self._softmax(z, temperature) for z in self.forward_continuation(enc, (self._replicate(cache), h_prefix))]
+        return [self._softmax(z, temperature) for z in self.forward_continuation(enc, prefix)]
 
     @torch.inference_mode()
     def probs_and_prefix(self, enc: EncodedRecord, temperature: float = 1.0):
@@ -674,11 +678,16 @@ def load_clef_checkpoint(
     path: str,
     device: str,
     dtype: torch.dtype = torch.bfloat16,
+    fused: bool | None = None,
 ) -> tuple[ClefDecisionModel, Any]:
     """Load a clef-flash checkpoint directory -> (ClefDecisionModel eval, processor).
 
     The backbone (Qwen3_5ForConditionalGeneration) is loaded from the checkpoint directory
-    itself (full weights); the JointSchemaHead is loaded via load_clef_head()."""
+    itself (full weights); the JointSchemaHead is loaded via load_clef_head().
+
+    `fused` (KEV_FUSED): True applies the fused Triton layers to the Qwen3.5 text backbone and fails
+    loudly if they cannot run; None ("auto") applies them on CUDA when flash-linear-attention is
+    importable at the pinned version and silently keeps eager otherwise; False declines."""
     from transformers import AutoProcessor
     p = Path(path)
     head_cfg = json.loads((p / "joint_head_config.json").read_text())
@@ -690,6 +699,20 @@ def load_clef_checkpoint(
                               processor=processor)
     load_clef_head(model, str(p))
     model.head.to(device=device, dtype=dtype)   # safetensors loads as fp32; cast to match backbone
+    if fused or (fused is None and str(device).startswith("cuda")):
+        from .fused_layers import apply_fused, fused_available
+        if fused or fused_available():
+            try:
+                apply_fused(model.lm)
+                model._fused = True
+                print("fused Qwen3.5 kernels on")
+            except NotImplementedError as e:   # MoE MLPs: fused kernels refuse them; eager keeps serving
+                if fused: raise
+                print(f"fused Qwen3.5 kernels off: {e}")
+        elif fused:
+            raise RuntimeError("KEV_FUSED=1 but flash-linear-attention at the pinned FLA_VERSION is not importable")
+        else:
+            print("fused Qwen3.5 kernels off: install flash-linear-attention at the pinned FLA_VERSION to turn them on")
     return model.eval(), processor
 
 

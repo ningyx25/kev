@@ -1,9 +1,13 @@
-"""HTTP tests with a fake backend (no GPU, no checkpoint): /v1/systemone routes, box -> 501, auth, images header."""
-import base64, io, threading
+"""HTTP tests with a fake backend (no GPU, no checkpoint): /v1/systemone routes, box -> 501, auth,
+images gate, multi-model routing, cards. Assembled through create_app + ModelRouter like the real CLI."""
+import base64, io
 import pytest
 from fastapi.testclient import TestClient
 
-from kev_serve import serve as srv
+from kev_serve.config import Settings
+from kev_serve.engine import SyncLockEngine
+from kev_serve.http_app import create_app
+from kev_serve.router import ModelRouter
 
 
 class FakeBackend:
@@ -13,6 +17,9 @@ class FakeBackend:
     requested = "fake"
     device = "cpu"
     seen = []
+
+    def __init__(self):
+        self.engine = SyncLockEngine()
 
     def answer(self, d):
         FakeBackend.seen.append(d)
@@ -29,8 +36,10 @@ class FakeBackend:
 
 @pytest.fixture()
 def client():
-    srv.app.state.server = FakeBackend()
-    return TestClient(srv.app)
+    FakeBackend.seen = []
+    b = FakeBackend()
+    settings = Settings()
+    return TestClient(create_app(settings, ModelRouter({"main": b}, "main")))
 
 
 def test_systemone_ok(client):
@@ -42,24 +51,34 @@ def test_systemone_ok(client):
 
 
 def test_box_returns_501(client):
+    # without the images header a box question is gated first (422, like TypeSafe); with it, no
+    # backend is registered for box yet -> 501
     r = client.post("/v1/systemone", json={
         "state": "s", "questions": {"b": {"type": "box", "instructions": "the mug in `photo`"}}})
+    assert r.status_code == 422
+    r = client.post("/v1/systemone", json={
+        "state": "s", "questions": {"b": {"type": "box", "instructions": "the mug in `photo`"}}},
+        headers={"TypeSafe-Danger-Zone-Images": "true"})
     assert r.status_code == 501
     assert "box" in r.json()["detail"]
 
 
 def test_auth(client, monkeypatch):
-    monkeypatch.setattr(srv, "API_KEY", "k1")
-    r = client.post("/v1/systemone", json={"state": "s", "questions": {"n": {"type": "noul", "instructions": "?"}}})
+    # auth is on only when Settings.api_key is set; rebuild the app with one
+    settings = Settings(api_key="k1")
+    app = create_app(settings, ModelRouter({"main": FakeBackend()}, "main"))
+    c = TestClient(app)
+    r = c.post("/v1/systemone", json={"state": "s", "questions": {"n": {"type": "noul", "instructions": "?"}}})
     assert r.status_code == 401
-    assert client.get("/v1/models").status_code == 401
+    assert c.get("/v1/models").status_code == 401
 
 
 def test_models_card(client):
-    r = client.get("/v1/models", headers={"Authorization": "Bearer k1"})
+    r = client.get("/v1/models")
     assert r.status_code == 200
     names = [m["name"] for m in r.json()["models"]]
-    assert names == ["kev-latest", "jev-latest"]
+    assert names[0] == "main"
+    assert set(names[1:]) == {"kev-latest", "jev-latest"}   # aliases onto the default backend
     assert r.json()["models"][0]["supported_primitives"] == ["choice", "noul", "score"]
 
 
@@ -74,7 +93,7 @@ def test_assets_require_images_header(client):
     body = {"state": {"photo": "ref1"}, "assets": {"ref1": {"type": "image", "format": "png", "data_base64": _png_b64()}},
             "questions": {"n": {"type": "noul", "instructions": "is the photo red?"}}}
     r = client.post("/v1/systemone", json=body)
-    assert r.status_code == 422 and srv.IMAGES_HEADER in r.json()["detail"]
+    assert r.status_code == 422 and "typesafe-danger-zone-images" in r.json()["detail"]
     r = client.post("/v1/systemone", json=body, headers={"TypeSafe-Danger-Zone-Images": "true"})
     assert r.status_code == 200
     sent = FakeBackend.seen[-1]

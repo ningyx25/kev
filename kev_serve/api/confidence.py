@@ -1,96 +1,16 @@
-"""TypeSafe (Jev-like) request/response shapes for POST /v1/systemone.
+"""Rendering, date facts, answer assembly and the confidence formulas.
 
-Noul   -> 2 options [false, true];            answer = p(true)
-Choice -> options 'name' or 'name: desc';      answer = argmax, probabilities by name, confidence
-Score  -> options = ordered level descriptions; answer = expected level, legend, probabilities by index
-Box    -> instructions name a target in an image asset; answer = {top, bottom, left, right} in [0, 1] + confidence
-         (schema only: no kev_serve backend answers Box yet; the HTTP layer returns 501)
-
-Copied from kev/api.py (kev monorepo, commit b6883b0) with the Box / assets extension.
-Confidence formulas mirror TypeSafe's system-one-adapter 0.2.1; do not change their semantics.
+Both confidence formulas mirror TypeSafe's reference adapter, system-one-adapter 0.2.1
+(src/system_one_adapter/_utils/confidence_metrics.py): p is normalised to sum 1 (all zeros -> uniform),
+one option -> 1. Do not change their semantics.
 """
 import json
 import re
 from datetime import datetime
-from typing import Any, Literal, Union
-from pydantic import BaseModel, Field, model_validator
+from typing import Any
 
-JSONContent = Union[str, dict, list, int, float, bool, None]
-MAX_OPTIONS = 255
-IMAGES_HEADER = "typesafe-danger-zone-images"
-
-
-class Noul(BaseModel):
-    type: Literal["noul"]
-    instructions: JSONContent = None
-    criteria: dict[str, JSONContent] | None = None
-
-
-class Choice(BaseModel):
-    type: Literal["choice"]
-    instructions: JSONContent = None
-    criteria: dict[str, JSONContent]
-
-    @model_validator(mode="after")
-    def _check(self):
-        if not 1 <= len(self.criteria) <= MAX_OPTIONS: raise ValueError(f"criteria must have 1..{MAX_OPTIONS} options")
-        return self
-
-
-class Score(BaseModel):
-    type: Literal["score"]
-    instructions: JSONContent = None
-    criteria: list[JSONContent] = Field(min_length=1, max_length=MAX_OPTIONS)
-
-
-class Box(BaseModel):
-    """A Box finds where something is in an image. No criteria; the instructions name the target and the image
-    (docs.typesafe.ai/primitives/box). Requires an image in the request (assets) and the images header."""
-    type: Literal["box"]
-    instructions: str
-
-    @model_validator(mode="after")
-    def _check(self):
-        if not self.instructions or not self.instructions.strip(): raise ValueError("box instructions must name the target")
-        return self
-
-
-Question = Union[Noul, Choice, Score, Box]
-QUESTION_TYPES = ("noul", "choice", "score", "box")
-
-
-class Asset(BaseModel):
-    """One image in the request's top-level `assets` map, referenced by its key wherever the image belongs
-    (docs.typesafe.ai/images)."""
-    type: Literal["image"]
-    format: str = "png"                      # jpg / png / webp ...
-    data_base64: str
-
-
-class SystemOneRequest(BaseModel):
-    state: JSONContent
-    model: str = "jev-latest"
-    questions: dict[str, Question] = Field(min_length=1)
-    assets: dict[str, Asset] | None = None   # Jev-style image assets, referenced by key from state / instructions
-    images: list[str] | None = None          # legacy kev form: base64 images (raw or data-URI), clef checkpoints only
-
-
-class BoxAnswer(BaseModel):
-    """The four edges as fractions of the image's width / height from the top-left corner; left < right, top < bottom."""
-    type: Literal["box"] = "box"
-    box: dict[str, float]
-    confidence: float
-
-    @model_validator(mode="after")
-    def _check(self):
-        e = self.box
-        for k in ("top", "bottom", "left", "right"):
-            if k not in e: raise ValueError(f"box edges need a {k!r}")
-            if not 0.0 <= e[k] <= 1.0: raise ValueError(f"{k} must be in [0, 1]")
-        if not e["left"] < e["right"]: raise ValueError("left must be < right")
-        if not e["top"] < e["bottom"]: raise ValueError("top must be < bottom")
-        if not 0.0 <= self.confidence <= 1.0: raise ValueError("confidence must be in [0, 1]")
-        return self
+from .primitives import JSONContent
+from .request import SystemOneRequest
 
 
 def render(v: JSONContent, indent: int = 0) -> str:
@@ -112,7 +32,7 @@ _DATE = re.compile(rf"\b(?:{MONTHS}) \d{{1,2}}, \d{{4}}\b|\b\d{{4}}-\d{{2}}-\d{{
 
 def date_facts(text: str) -> str:
     """Deterministic date arithmetic for the model: every pair of absolute dates found in `text`, as one sentence each
-    ("August 3, 2026 is 12 days after July 22, 2026."). The model cannot subtract dates reliably (issue #8); it can use a
+    ("August 3, 2026 is 12 days after July 22, 2026."). The model cannot subtract dates reliably; it can use a
     stated day count. Returns "" when fewer than two dates are found. Dates are listed in order of first appearance."""
     found = []
     for m in _DATE.finditer(text):
@@ -130,7 +50,7 @@ def date_facts(text: str) -> str:
 
 def with_date_facts(state):
     """State with a `date_facts` field (object states) or an appended paragraph (string states) when two or more absolute
-    dates appear. Opt-in preprocessing (KEV_DATE_FACTS=1 in kev_serve.serve)."""
+    dates appear. Opt-in preprocessing (Settings.date_facts)."""
     facts = date_facts(render(state))
     if not facts: return state
     if isinstance(state, dict): return {**state, "date_facts": facts}
@@ -165,8 +85,6 @@ def to_record(req: SystemOneRequest):
     return {"state": render(req.state), "questions": qs}, meta
 
 
-# Both confidence formulas mirror TypeSafe's reference adapter, system-one-adapter 0.2.1
-# (src/system_one_adapter/_utils/confidence_metrics.py): p is normalised to sum 1 (all zeros -> uniform), one option -> 1.
 def _normalize(p: list[float]) -> list[float]:
     t = sum(p)
     return [1 / len(p)] * len(p) if t == 0 else [x / t for x in p]

@@ -2,19 +2,35 @@
 name = "kev-serve"
 version = "0.1.0"
 description = "Standalone Jev-like (TypeSafe System One) deployment service: Noul / Choice / Score / Box primitives"
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.14"
 dependencies = [
-    "fastapi",
-    "uvicorn",
-    "pydantic>=2",
-    "torch",
-    "transformers",
-    "pillow",
+    "accelerate>=1.15.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.9",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "transformers==5.17.0",
+    "Pillow>=10.0",
     "safetensors",
 ]
 
 [project.optional-dependencies]
 test = ["pytest", "httpx"]
+
+serve = [
+    "typesafe-sdk>=0.6.0",
+    "mlx-lm>=0.31.3,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",   # the Apple Silicon backend (kev.mlx_model); a no-op elsewhere
+]
+
+mlx = [
+    "mlx-lm>=0.31.3,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+vision-kernels = [
+    "causal-conv1d==1.7.0",
+    "flash-linear-attention",
+]
 
 [build-system]
 requires = ["hatchling"]

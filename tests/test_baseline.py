@@ -17,7 +17,7 @@ CKPT = os.environ.get("KEV_SERVE_TEST_CKPT")
 @pytest.mark.skipif(not TOKENIZER, reason="set KEV_SERVE_TOKENIZER to a Qwen3.5 tokenizer dir")
 def test_encode_record_baseline():
     from transformers import AutoTokenizer
-    from kev_serve.clef_model import encode_record
+    from kev_serve.backends.clef.clef_model import encode_record
     tok = AutoTokenizer.from_pretrained(TOKENIZER, local_files_only=True)
     record = {
         "id": "baseline",

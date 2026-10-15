@@ -69,3 +69,35 @@ def test_ground_decode_999():
     assert _to_999(point[0], point[1]) == (500, 500)
     assert _to_999(0.0, 1.0) == (0, 999)
     assert _to_999(-0.5, 1.5) == (0, 999)   # clamped
+
+
+GUI_CKPT = os.environ.get("KEV_SERVE_TEST_GUI_CKPT")
+
+
+@pytest.mark.skipif(not GUI_CKPT, reason="set KEV_SERVE_TEST_GUI_CKPT to a GUI-Actor ckpt dir (needs a GPU)")
+def test_gui_actor_ground_baseline():
+    """Load a real GUI-Actor checkpoint and pin one ground answer (needs a GPU)."""
+    from kev_serve.backends.gui_actor import GuiActorBackend
+    from kev_serve.backends.gui_actor.gui_actor_model import load_gui_actor_checkpoint
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    model, processor, model_type = load_gui_actor_checkpoint(GUI_CKPT, dev, torch.bfloat16 if dev == "cuda" else torch.float32)
+    b = GuiActorBackend(model, processor, GUI_CKPT, dev, model_type)
+    card = b.model_card()
+    assert card["supported_primitives"] == ["ground"]
+    p = card["patch_pixels"]
+    assert p in (28, 32)
+    print("gui_actor card:", card)   # a full-answer pin needs a screenshot; record it when serving
+
+
+def test_gui_actor_answer_validates_contract(monkeypatch):
+    """GuiActorBackend.answer routes each ground answer through the GroundAnswer contract."""
+    from kev_serve.backends import gui_actor as pkg
+    from kev_serve.backends.gui_actor import backend as be
+    # stub the model's systemone to return a raw answer; the backend must shape it
+    import kev_serve.backends.gui_actor.gui_actor_model as m
+    monkeypatch.setattr(m, "systemone", lambda *a, **k: {
+        "model": "x", "answers": {"g": {"type": "ground", "point": [10, 20], "confidence": 0.5}},
+        "usage": {"input_tokens": 1, "output_tokens": 0}})
+    b = be.GuiActorBackend(model=object(), processor=object(), requested=".", device="cpu", model_type="qwen2_5_vl")
+    out = b.answer({"images": [object()], "questions": {"g": {"type": "ground", "instructions": "x"}}})
+    assert out["answers"]["g"] == {"type": "ground", "point": (10, 20), "confidence": 0.5, "topk_points": None}

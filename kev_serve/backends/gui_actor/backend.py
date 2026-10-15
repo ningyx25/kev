@@ -7,7 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..base import Backend
+from ...api.primitives import GroundAnswer
 from ...engine import SyncLockEngine
 
 SUPPORTED_PRIMITIVES = frozenset({"ground"})
@@ -37,12 +37,16 @@ class GuiActorBackend:
         self.engine = engine or SyncLockEngine()
 
     def answer(self, req_dict: dict[str, Any]) -> dict[str, Any]:
+        """One grounding pass per distinct instruction; each answer validated against the
+        GroundAnswer contract (0-999 point, confidence in [0, 1]) before it is returned."""
         from .gui_actor_model import systemone as gui_actor_systemone
         try:
-            return gui_actor_systemone(self.model, self.processor, req_dict, self.model_type, topk=self.topk)
+            resp = gui_actor_systemone(self.model, self.processor, req_dict, self.model_type, topk=self.topk)
         except ValueError as e:   # no image, or a question type this backend does not answer
             from fastapi import HTTPException
             raise HTTPException(422, str(e))
+        resp["answers"] = {qid: GroundAnswer(**a).model_dump() for qid, a in resp["answers"].items()}
+        return resp
 
     def answer_box(self, instructions: str, images: list):
         """Box is not implemented by this backend (its per-patch distribution gives a point /

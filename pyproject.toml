@@ -1,7 +1,7 @@
 [project]
 name = "kev-serve"
 version = "0.1.0"
-description = "Standalone Jev-like (TypeSafe System One) deployment service: Noul / Choice / Score / Box primitives"
+description = "Standalone Jev-like (TypeSafe System One) deployment service: Noul / Choice / Score / Box / Ground primitives"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "accelerate>=1.15.0",

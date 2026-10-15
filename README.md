@@ -37,16 +37,18 @@ Schemas live in `kev_serve/api/primitives.py`.
 
 ## Install & run
 
-```bash
-pip install -e ".[test]"          # core + tests;  pip install -e ".[serve,vision-kernels]" for the MLX / flash kernels
+Needs Python 3.12 or 3.13 and [uv](https://docs.astral.sh/uv/).
 
-python -m kev_serve --run main=<clef_checkpoint> --port 8008
+```bash
+uv sync --extra serve             # the service + the TypeSafe SDK;  --extra vision-kernels for the Qwen3.5 flash kernels
+
+uv run --extra serve python -m kev_serve --run main=<clef_checkpoint> --port 8008
 ```
 
 Load several models into one process; the request's `model` field routes between them:
 
 ```bash
-python -m kev_serve --run main=<clef_ckpt> --run grounder=<gui_actor_ckpt> --port 8008
+uv run --extra serve python -m kev_serve --run main=<clef_ckpt> --run grounder=<gui_actor_ckpt> --port 8008
 # noul / choice / score -> main     ground -> grounder     the wrong primitive on either -> 501
 ```
 
@@ -62,11 +64,11 @@ on a Qwen3.5 VL backbone). `gui_actor` is a directory whose weights carry the ve
 ### Docker
 
 ```dockerfile
-FROM python:3.12-slim
-RUN pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+RUN uv pip install --system torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 WORKDIR /app
 COPY . .
-RUN pip install --no-cache-dir -e .
+RUN uv pip install --system .
 EXPOSE 8008
 CMD ["python", "-m", "kev_serve", "--run", "main=/models/clef", "--host", "0.0.0.0", "--port", "8008"]
 ```
@@ -191,10 +193,10 @@ kev_serve/
 ## Tests
 
 ```bash
-pytest tests/                                                   # schema, server, router — no GPU
-KEV_SERVE_TOKENIZER=<qwen3.5-tokenizer> pytest tests/test_baseline.py   # clef encode spans
-KEV_SERVE_TEST_CKPT=<clef-ckpt>         pytest tests/test_baseline.py   # clef forward pass (GPU)
-KEV_SERVE_TEST_GUI_CKPT=<gui-actor-ckpt> pytest tests/test_baseline.py  # gui_actor load (GPU)
+uv run --extra test pytest tests/                                       # schema, server, router — no GPU
+KEV_SERVE_TOKENIZER=<qwen3.5-tokenizer> uv run --extra test pytest tests/test_baseline.py   # clef encode spans
+KEV_SERVE_TEST_CKPT=<clef-ckpt>         uv run --extra test pytest tests/test_baseline.py   # clef forward pass (GPU)
+KEV_SERVE_TEST_GUI_CKPT=<gui-actor-ckpt> uv run --extra test pytest tests/test_baseline.py  # gui_actor load (GPU)
 ```
 
 ---

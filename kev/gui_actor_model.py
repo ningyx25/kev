@@ -1,7 +1,7 @@
 """GUI-Actor serving: a pointer head over visual patches on a Qwen2.5-VL / Qwen3.5 backbone.
 
 GUI-Actor neither regresses coordinates nor answers by generating text. The prompt carries the
-full ``mobile_use`` click action whose coordinate list holds the
+full click action -- bare arguments JSON, no tool envelope -- whose coordinate list holds the
 ``<|pointer_start|><|pointer_pad|><|pointer_end|>`` placeholder triple, and the click point is
 the attention of the ``<|pointer_pad|>`` hidden state over the image patches. Placeholder mode
 is a single prefill (``max_new_tokens=1``): the answer does not depend on the generated token.
@@ -35,6 +35,7 @@ Loading: ``load_gui_actor_checkpoint``. The 3B/7B-Qwen2.5-VL checkpoints predate
 from __future__ import annotations
 
 import json
+import math
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .api import choice_confidence, render, round_prob
+from .api import render, round_prob
 
 # The transformers model_types this serves (the GUI-Actor repo calls them qwen25vl / qwen35).
 MODEL_TYPES = {"qwen2_5_vl", "qwen3_5"}
@@ -60,18 +61,21 @@ POINTER_END_TOKEN = "<|pointer_end|>"
 POINTER_PAD_TOKEN = "<|pointer_pad|>"
 # One click point, as the three special tokens that stand in for it.
 POINTER_PLACEHOLDER = POINTER_START_TOKEN + POINTER_PAD_TOKEN + POINTER_END_TOKEN
-# The action the model emits.  ``%s`` is whatever goes inside the JSON coordinate list.
-MOBILE_USE_CLICK_TEMPLATE = '{"name": "mobile_use", "arguments": {"action": "click", "coordinate": [%s]}}'
+# The assistant reply *is* the action, so it is just the arguments JSON: no tool-name
+# envelope and no <tool_call> wrapper (the tags only made sense while the reply carried a
+# name/arguments pair).  ``%s`` is whatever goes inside the JSON coordinate list: the
+# pointer placeholder here, or literal numbers when the model spells the point out itself.
+CLICK_ACTION_JSON = '{"action": "click", "coordinate": [%s]}'
 # The grounding system prompt the checkpoints were trained against (qwen2vl alone used a
 # shorter one; no such checkpoint is served here). The server sends it only when a request's
 # state renders to nothing -- otherwise the state IS the system prompt.
 GROUNDING_SYSTEM_MESSAGE = (
     "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
     "your task is to locate the screen element that corresponds to the instruction. You "
-    "should output a mobile_use action that performs a click on the correct position. To "
-    "indicate the click location, we will use some special tokens, which is used to refer "
-    "to a visual patch later. For example, you can output: "
-    f"{MOBILE_USE_CLICK_TEMPLATE % '<your_special_token_here>'}."
+    "should output a click action on the correct position. To indicate the click location, "
+    "we will use some special tokens, which is used to refer to a visual patch later. "
+    "For each function call, return its arguments as a json object:\n"
+    f"{CLICK_ACTION_JSON % '<your_special_token_here>'}"
 )
 # The Qwen2-VL-style inline chat template the model was trained with (its own checkpoints'
 # saved templates are the base Qwen templates and carry no pointer content).
@@ -91,8 +95,8 @@ ADDITIONAL_SPECIAL_TOKENS = ["<|recipient|>", "<|diff_marker|>", POINTER_START_T
 
 
 def format_click_action(coordinate: str = POINTER_PLACEHOLDER) -> str:
-    """Render the mobile_use click action, defaulting to the pointer placeholder."""
-    return MOBILE_USE_CLICK_TEMPLATE % coordinate
+    """Render the click action, defaulting to the pointer placeholder."""
+    return CLICK_ACTION_JSON % coordinate
 
 
 # ── vendored: the pointer head (gui_actor/modeling_base.py: VisionHead_MultiPatch) ────────
@@ -103,9 +107,20 @@ class VisionHead_MultiPatch(nn.Module):
     checkpoint transfers across screenshot resolutions.
     """
 
-    def __init__(self, d_model, projection_dim, num_attention_heads=8, dropout_rate=0.1):
+    def __init__(self, d_model, projection_dim, num_attention_heads=8, dropout_rate=0.1, temperature=1.0):
         super().__init__()
         self.d_model = d_model
+
+        # Post-hoc calibration scalar, read from ``config.pointer_temperature`` and applied
+        # by the *caller* to the confidence it derives -- never inside ``forward()``.  The
+        # returned distribution feeds a threshold + BFS region post-process, so rescaling it
+        # here would move the predicted point; dividing after the region is fixed is what
+        # keeps every existing output bit-identical.
+        #
+        # A plain attribute on purpose: a buffer would enter ``state_dict()`` and break
+        # strict loading of every checkpoint saved before this feature existed, and a
+        # parameter would join ``named_parameters()``.
+        self.temperature = float(temperature)
 
         # No extra normalisation on the inputs: the backbones already emit RMSNorm'd
         # hidden states.
@@ -132,7 +147,13 @@ class VisionHead_MultiPatch(nn.Module):
         self.layer_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, hidden_state_enc, hidden_state_dec, labels=None):
+    def forward(self, hidden_state_enc, hidden_state_dec, labels=None, return_logits=False):
+        """Returns ``(attn_weights, loss)``, plus ``patch_logits`` when ``return_logits``.
+
+        ``attn_weights`` is *always* the raw softmax (temperature 1).  The fitted
+        temperature is applied by the caller to the confidence scalar only, after the
+        predicted region has been extracted from these weights; see ``self.temperature``.
+        """
         enc_input = hidden_state_enc.unsqueeze(0)
         attn_output, _ = self.self_attention(query=enc_input, key=enc_input, value=enc_input, need_weights=False)
         enc_ctx = self.layer_norm(enc_input + self.dropout(attn_output)).squeeze(0)
@@ -156,6 +177,8 @@ class VisionHead_MultiPatch(nn.Module):
             pred_log_probs = F.log_softmax(patch_logits.float(), dim=-1)
             loss = F.kl_div(pred_log_probs, target_dist, reduction="batchmean")
 
+        if return_logits:
+            return attn_weights, loss, patch_logits
         return attn_weights, loss
 
 
@@ -165,10 +188,31 @@ def build_pointer_head(config, hidden_size: int | None = None) -> VisionHead_Mul
     For every released Qwen VL backbone the vision tower's ``out_hidden_size`` already
     equals the language model's ``hidden_size``, so the encoder (vision) and decoder
     (language) sides share one width and a single ``d_model`` is enough.
+
+    ``config.pointer_temperature`` is the fitted post-hoc calibration scalar.  Like the
+    ``pointer_*_token_id`` fields it is a plain extra key in ``config.json``, so it
+    survives ``save_pretrained`` / ``from_pretrained`` without a custom config class.
     """
     if hidden_size is None:
         hidden_size = config.text_config.hidden_size
-    return VisionHead_MultiPatch(hidden_size, hidden_size)
+    temperature = getattr(config, "pointer_temperature", 1.0)
+    if temperature is None:
+        temperature = 1.0
+    temperature = float(temperature)  # a hand-edited config.json can carry a string
+    if not (math.isfinite(temperature) and temperature > 0):
+        raise ValueError(f"pointer_temperature must be finite and positive, got {temperature}")
+    return VisionHead_MultiPatch(hidden_size, hidden_size, temperature=temperature)
+
+
+def pointer_temperature(model, override: float | None = None) -> float:
+    """The temperature the confidence is produced at: ``override``, else the head's fitted value."""
+    if override is not None:
+        value = float(override)
+        if not (math.isfinite(value) and value > 0):
+            raise ValueError(f"temperature must be finite and positive, got {value}")
+        return value
+    head = getattr(model, "multi_patch_pointer_head", None)
+    return float(getattr(head, "temperature", 1.0))
 
 
 # ── the backbone classes (gui_actor/modeling_qwen25vl.py, modeling_qwen3_5.py) ────────────
@@ -211,9 +255,26 @@ def _pointer_model_class(hf_model_type: str) -> type:
     return _POINTER_CLASSES[hf_model_type]
 
 
-# ── vendored: the region decode (gui_actor/inference.py: get_prediction_region_point) ─────
+# ── vendored: the region decode (gui_actor/inference.py) ─────────────────────────────────
+def region_confidence(patch_logits, region_indices, temperature: float = 1.0) -> float:
+    """Probability mass the temperature-scaled patch distribution puts on a region.
+
+    ``patch_logits`` is one row of *raw* (pre-softmax) scores -- a torch tensor or a
+    sequence of floats.  Taking the raw scores (rather than ``attn_scores``, which the
+    bf16 forward pass has already rounded through a softmax) is what lets the scalar be
+    recomputed at any temperature without re-running the model.  Subtracting the max is
+    exactly softmax-shift invariant and keeps large logits from overflowing.
+    """
+    z = torch.as_tensor(patch_logits, dtype=torch.float64).detach()
+    z = z - z.max()
+    probs = torch.softmax(z / float(temperature), dim=-1)
+    # float64 accumulation: in float32 a whole-grid region (hundreds of patches) can sum
+    # to slightly more than 1, and a probability mass must never exceed one.
+    return min(1.0, float(probs[torch.as_tensor(region_indices, dtype=torch.long)].sum()))
+
+
 def get_prediction_region_point(attn_scores, n_width, n_height, top_n=30, activation_threshold=0.3,
-                                return_all_regions=True, rect_center=False):
+                                return_all_regions=True, rect_center=False, return_region_indices=False):
     """Threshold the patch scores, split the survivors into 4-neighbour connected regions, and
     return the regions' weighted centres, best first.
 
@@ -226,7 +287,12 @@ def get_prediction_region_point(attn_scores, n_width, n_height, top_n=30, activa
     Patch ``idx`` sits at ``y = idx // n_width, x = idx % n_width``; a region's centre is the
     activation-weighted average of its patches' normalised centres, and regions are ranked by
     their mean activation. Coordinates are normalised to the model's (smart-resized) input.
+
+    With ``return_region_indices`` the flat patch indices of every region are returned too
+    (sorted alongside the centres and scores), which is what the confidence sums over.
     """
+    if return_region_indices and not return_all_regions:
+        raise ValueError("return_region_indices requires return_all_regions=True")
     # Get the highest activation value and threshold
     max_score = attn_scores[0].max().item()
     threshold = max_score * activation_threshold
@@ -282,11 +348,13 @@ def get_prediction_region_point(attn_scores, n_width, n_height, top_n=30, activa
     region_scores = []
     region_centers = []
     region_points = []
+    region_indices = []
 
     for region in regions:
         # Calculate average score for the region
         avg_score = sum(item[3] for item in region) / len(region)
         region_scores.append(avg_score)
+        region_indices.append([item[2] for item in region])
 
         # Calculate normalized center coordinates for each patch, then take the average
         normalized_centers = []
@@ -323,6 +391,7 @@ def get_prediction_region_point(attn_scores, n_width, n_height, top_n=30, activa
     sorted_scores = [region_scores[i] for i in sorted_indices]
     sorted_centers = [region_centers[i] for i in sorted_indices]
     sorted_points = [region_points[i] for i in sorted_indices]
+    sorted_region_indices = [region_indices[i] for i in sorted_indices]
     best_point = sorted_centers[0]
 
     if return_all_regions:
@@ -330,6 +399,9 @@ def get_prediction_region_point(attn_scores, n_width, n_height, top_n=30, activa
         # 2. sorted_centers: every region's center point, by average activation, descending
         # 3. sorted_scores: every region's average activation, descending
         # 4. sorted_points: every patch's normalized center, by its region's average activation
+        # 5. sorted_region_indices (opt-in): the flat patch indices of every region, same order
+        if return_region_indices:
+            return best_point, sorted_centers, sorted_scores, sorted_points, sorted_region_indices
         return best_point, sorted_centers, sorted_scores, sorted_points
     return best_point
 
@@ -438,10 +510,13 @@ def load_gui_actor_checkpoint(path: str, device: str, dtype: torch.dtype = torch
 # ── the grounding pass ────────────────────────────────────────────────────────────────────
 @torch.inference_mode()
 def _grounding_pass(model, processor, image, system_text: str, instruction: str):
-    """One placeholder-mode pass -> (attn_scores [1, n_patches], n_width, n_height, input tokens).
+    """One placeholder-mode pass -> (attn_scores [1, n_patches], patch_logits [n_patches],
+    n_width, n_height, input tokens).
 
     The steps mirror gui_actor.inference.inference() -- the path the deployment report measured
     end to end -- from the conversation through the two hidden states the head compares.
+    ``patch_logits`` is the raw pre-softmax row 0 (float32): the confidence is recomputed from
+    it at any temperature without re-running the model.
     Placeholder mode needs no logits processor: the prompt already ends inside the pointer
     triple, and nothing generated is read. The processor's inputs are passed on unfiltered:
     ``mm_token_type_ids`` is required for Qwen3.x's multimodal RoPE (raises without it) and is
@@ -464,15 +539,18 @@ def _grounding_pass(model, processor, image, system_text: str, instruction: str)
     decoder_hidden_states = results.hidden_states[0][-1][0][pointer_pad_mask]
     image_mask = inputs["input_ids"][0] == model.config.image_token_id
     image_embeds = results.hidden_states[0][0][0][image_mask]
-    attn_scores, _ = model.multi_patch_pointer_head(image_embeds, decoder_hidden_states)
+    attn_scores, _, patch_logits = model.multi_patch_pointer_head(
+        image_embeds, decoder_hidden_states, return_logits=True
+    )
 
     # image_grid_thw is in patch units; the visual tokens are merged, so divide by the merge
     # factor. Composite layout: the tower is model.model.visual.
     _, n_height, n_width = (inputs["image_grid_thw"][0] // model.model.visual.spatial_merge_size).tolist()
-    return attn_scores, n_width, n_height, int(inputs["input_ids"].shape[1])
+    return attn_scores, patch_logits[0].float(), n_width, n_height, int(inputs["input_ids"].shape[1])
 
 
-def patch_answer(attn_scores, n_width: int, n_height: int, patch_pixels: int, topk: int = TOPK) -> dict:
+def patch_answer(attn_scores, patch_logits, n_width: int, n_height: int, patch_pixels: int,
+                 topk: int = TOPK, temperature: float = 1.0) -> dict:
     """The TypeSafe answer for one grounding pass: a ``choice`` over the patch grid.
 
     ``choice`` is the argmax patch index as a string and ``probabilities`` the head's softmax
@@ -480,17 +558,30 @@ def patch_answer(attn_scores, n_width: int, n_height: int, patch_pixels: int, to
     index back to the image with ``y = idx // n_width, x = idx % n_width`` and the patch
     centre ``((x+0.5)/n_width, (y+0.5)/n_height)`` -- normalized to the model's own
     (smart-resized) input, whose size is ``n_width*patch_pixels x n_height*patch_pixels``.
-    ``point``/``topk_points``/``topk_values`` are the same pass's region decode, free to
-    include; ``topk=0`` drops them.
+
+    ``confidence`` is the probability mass the (temperature-scaled) patch distribution puts
+    on the predicted region -- a derived scalar, not a second prediction head; the fitted
+    temperature only rescales it, never the point. ``confidence_raw`` is the same at
+    temperature 1 and ``temperature`` the scalar they were produced at. ``point``/
+    ``topk_points``/``topk_values`` are the same pass's region decode, free to include;
+    ``topk=0`` drops them.
     """
     probs = attn_scores[0].float().tolist()
     best = max(range(len(probs)), key=probs.__getitem__)
+    # CPU first: the decode calls .item() per activated patch.  Region extraction reads the
+    # *raw* distribution, so the temperature cannot move the point -- it is applied to the
+    # confidence below, once the region is fixed.
+    _, _, _, _, region_indices = get_prediction_region_point(
+        attn_scores.float().cpu(), n_width, n_height,
+        return_all_regions=True, rect_center=False, return_region_indices=True)
+    top_region = [int(i) for i in region_indices[0]]
     answer = {"type": "choice", "choice": str(best),
-              "confidence": round_prob(choice_confidence(probs), PATCH_PROB_DECIMALS),
+              "confidence": round_prob(region_confidence(patch_logits, top_region, temperature), PATCH_PROB_DECIMALS),
+              "confidence_raw": round_prob(region_confidence(patch_logits, top_region, 1.0), PATCH_PROB_DECIMALS),
+              "temperature": float(temperature),
               "probabilities": {str(i): round_prob(p, PATCH_PROB_DECIMALS) for i, p in enumerate(probs)},
               "n_width": int(n_width), "n_height": int(n_height), "patch_pixels": int(patch_pixels)}
     if topk:
-        # CPU first: the decode calls .item() per activated patch.
         point, points, values, _ = get_prediction_region_point(
             attn_scores.float().cpu(), n_width, n_height, return_all_regions=True, rect_center=False)
         answer["point"] = [round(float(point[0]), PATCH_PROB_DECIMALS), round(float(point[1]), PATCH_PROB_DECIMALS)]
@@ -522,13 +613,15 @@ def systemone(model, processor, request: dict, model_type: str, topk: int = TOPK
     image = images[-1]
     system_text = render(request.get("state")).strip() or GROUNDING_SYSTEM_MESSAGE
     patch_pixels = get_merged_token_pixels(model_type)
+    temperature = pointer_temperature(model)
     answers, input_tokens, passes = {}, 0, {}
     for qid, question in (request.get("questions") or {}).items():
         instruction = render(question.get("instructions"))
         if instruction not in passes:   # questions sharing an instruction share the pass
             passes[instruction] = _grounding_pass(model, processor, image, system_text, instruction)
-        attn_scores, n_width, n_height, n_tokens = passes[instruction]
+        attn_scores, patch_logits, n_width, n_height, n_tokens = passes[instruction]
         input_tokens += n_tokens
-        answers[qid] = patch_answer(attn_scores, n_width, n_height, patch_pixels, topk)
+        answers[qid] = patch_answer(attn_scores, patch_logits, n_width, n_height, patch_pixels, topk,
+                                    temperature=temperature)
     return {"model": request.get("model", "kev-latest"), "answers": answers,
             "usage": {"input_tokens": input_tokens, "output_tokens": 0}}

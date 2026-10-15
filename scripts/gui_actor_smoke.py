@@ -86,7 +86,8 @@ def main():
         ans = body["answers"]["tap"]
         probs = ans["probabilities"]
         print(f"grid {ans['n_width']}x{ans['n_height']} ({len(probs)} patches), patch_pixels {ans['patch_pixels']}")
-        print(f"choice {ans['choice']} (confidence {ans['confidence']}); sum(probabilities) = {sum(probs.values()):.6f}")
+        print(f"choice {ans['choice']} (confidence {ans['confidence']} at T={ans['temperature']}, raw {ans['confidence_raw']}); "
+              f"sum(probabilities) = {sum(probs.values()):.6f}")
         print(f"point {ans['point']}  topk_points {ans['topk_points']}  topk_values {[round(v, 4) for v in ans['topk_values']]}")
         print(f"input_tokens {body['usage']['input_tokens']}; one pass {dt:.2f}s")
 

@@ -4,6 +4,7 @@ Images arrive decoded (PIL) in req_dict["images"]; the HTTP layer does base64 / 
 Requests run on the engine (SyncLockEngine): every grounding pass is blocking, batch=1."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,8 @@ from ...api.primitives import GroundAnswer
 from ...engine import SyncLockEngine
 
 SUPPORTED_PRIMITIVES = frozenset({"ground"})
-TOPK = 5   # alternative region centres a ground answer carries (0 = the point and confidence only)
+# Alternative region centres a ground answer carries; KEV_GUI_ACTOR_TOPK=0 keeps only the point and confidence.
+TOPK = int(os.environ.get("KEV_GUI_ACTOR_TOPK", "5"))
 
 
 def file_release_date(path: str) -> str:

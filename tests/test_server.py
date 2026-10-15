@@ -19,7 +19,7 @@ class FakeBackend:
     seen = []
 
     def __init__(self):
-        self.engine = SyncLockEngine()
+        self.engine = SyncLockEngine(self)
 
     def answer(self, d):
         FakeBackend.seen.append(d)

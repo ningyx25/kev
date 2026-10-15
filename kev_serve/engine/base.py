@@ -1,33 +1,46 @@
 """Execution engines: how a backend's forward passes are scheduled.
 
-An engine turns a blocking call into an awaitable for the HTTP layer. ClefBackend uses SyncLockEngine
-(a lock plus the event loop's executor). The slot for the future kev pointer-head backend is QueueBatchEngine
-(one model thread draining a queue into batches, with a state-prefix cache) — same interface, no HTTP changes
-when it arrives."""
+An engine is bound to one backend instance (its `.engine`) and runs that backend's requests off the
+event loop: `run(d) -> response body`. SyncLockEngine serialises blocking calls through one lock (a
+backend with a single blocking forward pass and no batching). QueueBatchEngine (engine/batch.py) is
+the continuous-batching one: a model thread drains a queue into batches and runs them through the
+backend's answer_batch(_with_prefix), with the state-prefix cache and OOM resilience.
+"""
 import asyncio
 import threading
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Protocol
 
 
 class ExecutionEngine(Protocol):
-    def submit(self, fn: Callable[[], Any]) -> Awaitable[Any]: ...
+    async def run(self, d: dict) -> dict:
+        """Answer one request dict (the shape backends.base.Backend.answer takes)."""
+        ...
+
     def close(self) -> None: ...
+
+    def stats(self) -> dict | None:
+        """Batching/caching counters for the /v1/models card; None when the engine keeps none."""
+        ...
 
 
 class SyncLockEngine:
     """Serialise blocking calls through one lock and run them on the event loop's default executor.
-    Right for backends with a single blocking forward pass per request (clef, GUI-Actor)."""
+    Right for backends with a single blocking forward pass per request and no batching (GUI-Actor)."""
 
-    def __init__(self):
+    def __init__(self, backend):
+        self.backend = backend
         self.lock = threading.Lock()
 
     def _run(self, fn):
         with self.lock:
             return fn()
 
-    async def submit(self, fn: Callable[[], Any]) -> Any:
+    async def run(self, d: dict) -> dict:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._run, fn)
+        return await loop.run_in_executor(None, self._run, lambda: self.backend.answer(d))
 
     def close(self) -> None:
         pass
+
+    def stats(self) -> dict | None:
+        return None

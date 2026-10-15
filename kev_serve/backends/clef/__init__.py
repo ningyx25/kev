@@ -4,9 +4,13 @@ from ..base import register_backend
 from .clef_model import is_clef, load_clef_checkpoint
 
 
-def _factory(path: str, device: str, dtype):
+def _factory(path: str, device: str, dtype, settings=None):
+    from ...engine import make_engine
     model, processor = load_clef_checkpoint(path, device, dtype)
-    return ClefBackend(model, processor, path, device)
+    b = ClefBackend(model, processor, path, device,
+                    temperature=settings.temperature if settings else None)
+    b.engine = make_engine(b, settings) if settings is not None else b.engine   # clef batches: settings chooses the engine
+    return b
 
 
 register_backend("clef", is_clef, _factory)

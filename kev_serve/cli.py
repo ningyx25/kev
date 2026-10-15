@@ -6,12 +6,14 @@ request's `model` field routes between them (ModelRouter). `--default` picks the
 `@gpu` after a checkpoint puts that model on one GPU of a multi-GPU box (`--run main=clef@2`
 `--run grounder=gui@3`); without it, every model uses `--device`."""
 import argparse
+import os
 
 import torch
 
 from .backends import load_backend
 from .config import Settings
 from .device import DEVICE_HELP, _cuda_index, select
+from .hub import is_hub_id, resolve_checkpoint
 from .http_app import create_app
 from .router import ModelRouter
 
@@ -54,6 +56,7 @@ def main():
     ap.add_argument("--run", action="append", required=True, metavar="name=ckpt[@gpu]",
                     help="a model name, its checkpoint directory, and optionally the GPU (name=ckpt@2); repeat per model")
     ap.add_argument("--default", default=None, help="model name unknown `model` fields fall back to (default: the first --run)")
+    ap.add_argument("--fallback", default=None, help="checkpoint to load when a --run path is missing (unset = fail instead)")
     ap.add_argument("--host", default="127.0.0.1", help="interface to bind; 0.0.0.0 to serve beyond this machine")
     ap.add_argument("--port", type=int, default=8008)
     ap.add_argument("--device", default="auto", help=DEVICE_HELP)
@@ -64,11 +67,14 @@ def main():
     resolved: dict = {}    # device string -> (family, GPU index); see device_for
     backends = {}
     for name, path, gpu in runs:
+        if a.fallback and not os.path.exists(path) and not is_hub_id(path):
+            print(f"{path} not found, falling back to {a.fallback}")
+            path = a.fallback
         dev = device_for(gpu, a.device, resolved, set_device=torch.cuda.set_device)
         dtype = torch.bfloat16 if dev != "cpu" else torch.float32
         print(f"loading {name} <- {path} on {dev} ({dtype})")
         try:
-            backends[name] = load_backend(path, dev, dtype)
+            backends[name] = load_backend(resolve_checkpoint(path), dev, dtype, settings=settings)
         except (ValueError, RuntimeError) as e:   # a config/checkpoint error, not a bug: exit cleanly
             raise SystemExit(f"could not load {name} from {path}: {e}") from None
     settings.models = {name: b.requested for name, b in backends.items()}

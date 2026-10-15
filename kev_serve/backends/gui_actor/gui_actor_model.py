@@ -586,7 +586,8 @@ def ground_answer(attn_scores, patch_logits, n_width: int, n_height: int,
 
 
 @torch.inference_mode()
-def systemone(model, processor, request: dict, model_type: str, topk: int = TOPK) -> dict:
+def systemone(model, processor, request: dict, model_type: str, topk: int = TOPK,
+              temperature: float | None = None) -> dict:
     """Answer a /v1/systemone request dict with ground answers (kev_serve adds latency_ms).
 
     The request's ``state`` is the system prompt (the checkpoints' own grounding prompt only
@@ -605,7 +606,7 @@ def systemone(model, processor, request: dict, model_type: str, topk: int = TOPK
 
     image = images[-1]
     system_text = render(request.get("state")).strip() or GROUNDING_SYSTEM_MESSAGE
-    temperature = pointer_temperature(model)
+    temperature = pointer_temperature(model, temperature)   # KEV_TEMPERATURE override, else the fitted scalar
     answers, input_tokens, passes = {}, 0, {}
     for qid, question in (request.get("questions") or {}).items():
         instruction = render(question.get("instructions"))

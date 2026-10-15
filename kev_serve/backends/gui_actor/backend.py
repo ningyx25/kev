@@ -30,20 +30,22 @@ class GuiActorBackend:
     supported_primitives = SUPPORTED_PRIMITIVES
 
     def __init__(self, model, processor, requested: str, device: str, model_type: str,
-                 topk: int = TOPK, engine: SyncLockEngine | None = None):
+                 topk: int = TOPK, temperature: float | None = None, engine=None):
         self.model, self.processor = model, processor
         self.requested, self.device = requested, device
         self.model_type = model_type            # transformers model_type (qwen2_5_vl / qwen3_vl / qwen3_5 / ...)
         self.topk = topk
+        self.temperature_override = temperature # KEV_TEMPERATURE; None = the checkpoint's fitted pointer_temperature
         self.release_date = file_release_date(requested)
-        self.engine = engine or SyncLockEngine()
+        self.engine = engine or SyncLockEngine(self)
 
     def answer(self, req_dict: dict[str, Any]) -> dict[str, Any]:
         """One grounding pass per distinct instruction; each answer validated against the
         GroundAnswer contract (0-999 point, confidence in [0, 1]) before it is returned."""
         from .gui_actor_model import systemone as gui_actor_systemone
         try:
-            resp = gui_actor_systemone(self.model, self.processor, req_dict, self.model_type, topk=self.topk)
+            resp = gui_actor_systemone(self.model, self.processor, req_dict, self.model_type, topk=self.topk,
+                                       temperature=self.temperature_override)
         except ValueError as e:   # no image, or a question type this backend does not answer
             from fastapi import HTTPException
             raise HTTPException(422, str(e))
@@ -55,12 +57,22 @@ class GuiActorBackend:
         region, not calibrated edges); a future head may override this."""
         raise NotImplementedError("gui_actor answers ground, not box")
 
+    @property
+    def tokenizer(self):
+        return getattr(self.processor, "tokenizer", None)
+
+    @property
+    def temperature(self) -> float:
+        """The calibration the confidence is produced at: KEV_TEMPERATURE, else the fitted pointer_temperature."""
+        from .gui_actor_model import pointer_temperature
+        return pointer_temperature(self.model, self.temperature_override)
+
     def model_card(self) -> dict[str, Any]:
         from .gui_actor_model import get_merged_token_pixels
         return {"description": f"GUI-Actor pointer head on {self.model_type}, serving {self.requested}",
                 "supported_primitives": sorted(self.supported_primitives),
                 "model_type": self.model_type, "patch_pixels": get_merged_token_pixels(self.model_type),
-                "topk": self.topk}
+                "temperature": self.temperature, "topk": self.topk}
 
     def close(self) -> None:
         self.engine.close()

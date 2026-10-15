@@ -6,9 +6,10 @@ from ..base import register_backend
 from .gui_actor_model import is_gui_actor_checkpoint, load_gui_actor_checkpoint
 
 
-def _factory(path: str, device: str, dtype):
+def _factory(path: str, device: str, dtype, settings=None):
     model, processor, model_type = load_gui_actor_checkpoint(path, device, dtype)
-    return GuiActorBackend(model, processor, path, device, model_type)
+    return GuiActorBackend(model, processor, path, device, model_type,
+                           temperature=settings.temperature if settings else None)
 
 
 register_backend("gui_actor", is_gui_actor_checkpoint, _factory)

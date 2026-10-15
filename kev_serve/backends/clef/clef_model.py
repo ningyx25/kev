@@ -58,6 +58,8 @@ class EncodedRecord:
     questions:  tuple[EncodedQuestion, ...]
     record_id:  str
     media:      dict[str, Any] | None = dc_field(default=None, compare=False, repr=False)
+    prefix_len: int = 0   # tokens before the schema: system + user header + media + state (see encode_record); the
+                          # prefix-cache unit — everything up to here depends only on the state, not the questions
 
 
 # ── encoding helpers ──────────────────────────────────────────────────────────
@@ -217,6 +219,7 @@ def encode_record(tokenizer: Any, record: dict[str, Any],
         questions=shifted,
         record_id=str(record.get("id", "unknown")),
         media=media,
+        prefix_len=len(prefix_ids) + len(state_ids),
     )
 
 
@@ -527,24 +530,102 @@ class ClefDecisionModel(nn.Module):
             base.get_output_embeddings().weight,
         )
 
+    # ── prefix caching (kev_serve's QueueBatchEngine) ───────────────────────────────────────
+    # The cached unit is the record's prefix: system + user header + state (prefix_len tokens), everything
+    # the questions do not touch. The head cross-attends over the WHOLE prompt's hidden states, so a
+    # prefix is (past_key_values, prefix hidden states); a continuation re-attaches them — exact, because
+    # causality says a prefix token's hidden states do not depend on the schema that follows. Text-only
+    # records cache (a media record's 3D mrope positions are computed over the whole prompt by the VL
+    # wrapper and do not slice cleanly); media records run the one-pass forward_batch.
+
+    def _base(self):
+        lm = self.lm
+        return lm.get_base_model() if hasattr(lm, "get_base_model") else lm
+
+    def _text_model(self):
+        model = self._base().model
+        return model.language_model if hasattr(model, "language_model") else model
+
+    @torch.inference_mode()
+    def state_pass(self, enc: EncodedRecord):
+        """Run the record's prefix tokens only. -> (cache kept exactly at the prefix, prefix hidden states)."""
+        from transformers import DynamicCache
+        ids = torch.tensor([list(enc.input_ids[:enc.prefix_len])], device=next(self.parameters()).device)
+        out = self._text_model()(input_ids=ids, use_cache=True, return_dict=True)
+        return out.past_key_values, out.last_hidden_state[0]
+
+    @staticmethod
+    def _replicate(cache):
+        """A copy of the prefix cache whose tensor state the continuation may consume: the stored prefix
+        must stay pristine for the next request (kev's old rows_hidden replicated for the same reason).
+        Shallow layer copies + cloned tensors: the layers' structure is shared, their contents are not."""
+        import copy as _copy
+        def cloned(v):
+            if isinstance(v, torch.Tensor): return v.clone()
+            if isinstance(v, list): return [cloned(x) for x in v]
+            if isinstance(v, tuple): return tuple(cloned(x) for x in v)
+            return v
+        dup = _copy.copy(cache)
+        dup.layers = []
+        for layer in cache.layers:
+            d = _copy.copy(layer)
+            for name, v in list(vars(d).items()):
+                c = cloned(v)
+                if c is not v: setattr(d, name, c)
+            dup.layers.append(d)
+        return dup
+
+    @torch.inference_mode()
+    def forward_continuation(self, enc: EncodedRecord, prefix) -> list[torch.Tensor]:
+        """Per-question logits for a record whose prefix tokens equal the cached prefix's; only the
+        schema runs, and the prefix hidden states are re-attached so the head sees the same full-prompt
+        layout as in a one-pass forward (spans keep their absolute coordinates)."""
+        cache, h_prefix = prefix
+        p = enc.prefix_len
+        dev = h_prefix.device
+        new_ids = torch.tensor([list(enc.input_ids[p:])], device=dev)
+        full_len = len(enc.input_ids)
+        mask = torch.ones((1, full_len), dtype=torch.long, device=dev)   # the full causal context, no padding
+        out = self._text_model()(input_ids=new_ids, attention_mask=mask, past_key_values=self._replicate(cache),
+                                 use_cache=True, return_dict=True)
+        hidden = torch.cat([h_prefix.unsqueeze(0), out.last_hidden_state], 1)
+        return self.head(hidden, torch.tensor([list(enc.input_ids)], device=dev), mask, [enc],
+                         self._base().get_output_embeddings().weight)[0]
+
     def forward(self, enc: EncodedRecord) -> list[torch.Tensor]:
         return self.forward_batch([enc])[0]
 
-    @torch.inference_mode()
-    def probs(self, enc: EncodedRecord) -> list[list[float]]:
-        logits = self.forward(enc)
-        return [z.float().softmax(-1).tolist() for z in logits]
+    @staticmethod
+    def _softmax(logits: torch.Tensor, temperature: float) -> list[float]:
+        """Probabilities at a calibration temperature: logits / T before softmax (the TypeSafe
+        KEV_TEMPERATURE semantics — a scalar on the logits, not a post-hoc reshape of p)."""
+        z = logits.float()
+        return (z / temperature if temperature != 1.0 else z).softmax(-1).tolist()
 
     @torch.inference_mode()
-    def probs_batch(self, encs: list[EncodedRecord]) -> list[list[list[float]]]:
-        logits_b = self.forward_batch(encs)
-        return [[z.float().softmax(-1).tolist() for z in logits] for logits in logits_b]
+    def probs(self, enc: EncodedRecord, temperature: float = 1.0) -> list[list[float]]:
+        return [self._softmax(z, temperature) for z in self.forward(enc)]
 
-    def probs_and_prefix(self, enc: EncodedRecord):
-        return self.probs(enc), None
+    @torch.inference_mode()
+    def probs_batch(self, encs: list[EncodedRecord], temperature: float = 1.0) -> list[list[list[float]]]:
+        return [[self._softmax(z, temperature) for z in logits] for logits in self.forward_batch(encs)]
 
-    def probs_with_prefix(self, enc: EncodedRecord, prefix):
-        return self.probs(enc)
+    @torch.inference_mode()
+    def probs_with_prefix(self, enc: EncodedRecord, prefix, temperature: float = 1.0) -> list[list[float]]:
+        """probs() for a record whose prefix tokens equal the cached prefix's (prefix is the
+        (cache, hidden) pair state_pass returned); only the schema runs."""
+        if enc.prefix_len == 0: raise ValueError("prefix does not match this record (it has no prefix)")
+        cache, h_prefix = prefix
+        return [self._softmax(z, temperature) for z in self.forward_continuation(enc, (self._replicate(cache), h_prefix))]
+
+    @torch.inference_mode()
+    def probs_and_prefix(self, enc: EncodedRecord, temperature: float = 1.0):
+        """One record's probabilities plus its fresh prefix (state_pass + continuation: the miss path
+        the engine takes when keep[i] says the prefix will outlive the batch)."""
+        if enc.prefix_len == 0: return self.probs(enc, temperature), None
+        prefix = self.state_pass(enc)
+        logits = self.forward_continuation(enc, prefix)
+        return [self._softmax(z, temperature) for z in logits], prefix
 
     graphs           = None
     dtype            = property(lambda self: next(self.parameters()).dtype)
@@ -634,10 +715,11 @@ def _systemone_answer(question: dict[str, Any], probabilities: dict[str, float])
 
 @torch.no_grad()
 def systemone(model: ClefDecisionModel, processor: Any, request: dict[str, Any],
-              max_length: int = 16384) -> dict[str, Any]:
+              max_length: int = 16384, temperature: float = 1.0) -> dict[str, Any]:
     """Answer a TypeSafe /v1/systemone request dict with a TypeSafe response dict.
 
-    Images in request['images'] must be PIL Images (already decoded from base64 by kev.serve).
+    Images in request['images'] must be PIL Images (already decoded from base64 by the HTTP layer).
+    `temperature` divides the head's logits before the softmax (the calibration scalar; 1.0 = raw).
     """
     questions = request.get("questions")
     r: dict[str, Any] = {"state": request["state"], "questions": questions}
@@ -646,12 +728,11 @@ def systemone(model: ClefDecisionModel, processor: Any, request: dict[str, Any],
         r["images"] = imgs
     tok = processor.tokenizer
     enc = encode_record(tok, r, max_length=max_length, processor=processor if imgs else None)
-    dev = next(model.parameters()).device
     logits = model.forward_batch([enc])[0]
     answers = {
         q.question_id: _systemone_answer(
             questions[q.question_id],
-            dict(zip(q.option_ids, ql.float().softmax(-1).tolist())),
+            dict(zip(q.option_ids, model._softmax(ql, temperature))),
         )
         for q, ql in zip(enc.questions, logits)
     }

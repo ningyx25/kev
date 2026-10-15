@@ -15,12 +15,13 @@ if __name__ == "__main__" and os.name == "posix":
 import torch
 
 DEVICES = ("cpu", "cuda", "mps")
+# A `cuda:N` string (which GPU of a multi-GPU box) is accepted anywhere a device string is; see select().
 # The child prints one line with this prefix. ROCm and other wheels write startup text to stdout around it;
 # a bare "cuda" line in that text is not a result.
 PROBE_PREFIX = "kev-device "
 DEVICE_HELP = ("auto probes in a child process and falls back to cpu (CUDA/ROCm first, then MPS; "
                "each probe waits KEV_DEVICE_PROBE_TIMEOUT seconds, default 30); "
-               "an explicit accelerator fails closed; cpu skips discovery")
+               "cuda / cuda:N picks that GPU (default 0); an explicit accelerator fails closed; cpu skips discovery")
 
 
 def default_device():
@@ -39,24 +40,52 @@ def probe_timeout():
     return timeout
 
 
+def _cuda_index(device: str) -> int | None:
+    """The GPU index of a `cuda` / `cuda:N` string, or None for a non-CUDA device. A bad index raises."""
+    if device == "cuda":
+        return 0
+    if device.startswith("cuda:"):
+        raw = device.split(":", 1)[1]
+        if not raw.isdigit():
+            raise ValueError(f"unsupported device {device!r}; the GPU index after 'cuda:' must be a number")
+        return int(raw)
+    return None
+
+
+def _check_device(device: str) -> None:
+    """Reject a bad device string here (no CUDA call in this process: the probe child owns that and fails closed)."""
+    if device == "auto" or device in DEVICES:
+        return
+    index = _cuda_index(device)
+    if index is None or index < 0:
+        raise ValueError(f"unsupported device {device!r}; choose auto, {', '.join(DEVICES)}, or cuda:N")
+
+
 def select(device="auto", *, dtype=torch.float32, timeout=None):
     """Resolve a device before loading weights. A fresh interpreter contains native driver crashes.
 
     Explicit CPU never inspects accelerators. Auto tries CUDA/ROCm and, if that probe fails, MPS, then falls back to CPU.
-    An explicit accelerator fails closed. This tests one allocation/matmul/sync, not every model kernel or whether the checkpoint fits.
+    `cuda:N` probes and then selects that GPU (`torch.cuda.set_device(N)`), so a later `torch.cuda.current_device()`
+    — the clef loader's device_map — lands on the right one. An explicit accelerator fails closed. This tests one
+    allocation/matmul/sync, not every model kernel or whether the checkpoint fits.
     """
-    if device != "auto" and device not in DEVICES:
-        raise ValueError(f"unsupported device {device!r}; choose auto or one of {DEVICES}")
+    _check_device(device)
     if device == "cpu":
         return device
     if timeout is None:
         timeout = probe_timeout()
+    attempts = ("auto", "mps") if device == "auto" else (device,)
     failures = []
-    for attempt in (("auto", "mps") if device == "auto" else (device,)):
+    for attempt in attempts:
         try:
-            return _run_probe(attempt, dtype, timeout)
-        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            resolved = _run_probe(attempt, dtype, timeout)
+        except (OSError, subprocess.SubprocessError, ValueError) as error:   # includes CalledProcessError
             failures.append((attempt, error))
+            continue
+        index = _cuda_index(attempt)   # the GPU the caller asked for ("cuda" -> 0), not the child's family echo
+        if index is not None:
+            torch.cuda.set_device(index)
+        return resolved
     message = "Device probe failed (" + "; ".join(f"{attempt}: {_probe_detail(error)}" for attempt, error in failures) + ")."
     if device != "auto":
         raise RuntimeError(f"{message} Fix the accelerator runtime or pass --device cpu.") from failures[-1][1]
@@ -77,10 +106,12 @@ def _run_probe(device, dtype, timeout):
                             capture_output=True, text=True, errors="replace", timeout=timeout, check=True)
     reported = [line[len(PROBE_PREFIX):].strip() for line in result.stdout.splitlines() if line.startswith(PROBE_PREFIX)]
     resolved = reported[-1] if reported else ""
-    if resolved not in DEVICES or (device != "auto" and resolved != device):
+    # a `cuda:N` request (or the child's own echo) reduces to the family "cuda"; "auto" accepts cpu/cuda/mps
+    family = "cuda" if _cuda_index(resolved) is not None else resolved
+    if family not in DEVICES or (device != "auto" and family != "cuda" and family != device):
         tail = next((line.strip() for line in reversed(result.stdout.splitlines()) if line.strip()), "")
         raise ValueError(f"unexpected probe result {(resolved or tail)!r}")
-    return resolved
+    return family
 
 
 def _probe(device, dtype):

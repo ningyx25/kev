@@ -503,7 +503,10 @@ def load_gui_actor_checkpoint(path: str, device: str, dtype: torch.dtype = torch
                            "serve this checkpoint on a GPU (CUDA_VISIBLE_DEVICES=<n>)")
     processor = AutoProcessor.from_pretrained(path, local_files_only=True)
     _require_pointer_tokens(processor.tokenizer, path)
-    load_kwargs: dict[str, Any] = {"torch_dtype": dtype, "device_map": "cuda:0" if device == "cuda" else device}
+    # the GPU kev_serve.device.select() made current (`--run name=ckpt@N`), not a fixed cuda:0, so
+    # several models in one process can sit on different GPUs
+    load_kwargs: dict[str, Any] = {"torch_dtype": dtype,
+                                   "device_map": torch.cuda.current_device() if device == "cuda" else device}
     if attn is not None:
         load_kwargs["attn_implementation"] = attn
     model = _pointer_model_class(hf_model_type).from_pretrained(path, **load_kwargs).eval()

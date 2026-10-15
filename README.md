@@ -52,8 +52,20 @@ uv run --extra serve python -m kev_serve --run main=<clef_ckpt> --run grounder=<
 # noul / choice / score -> main     ground -> grounder     the wrong primitive on either -> 501
 ```
 
-`scripts/serve.sh <ckpt> [port]` wraps the single-model case. Flags: `--host` (default `127.0.0.1`;
-use `0.0.0.0` in a container), `--port`, `--device auto|cpu|cuda|mps`, `--default <name>`.
+**Several GPUs.** Put each model on its own GPU with `@N` after the checkpoint (or `@cuda:N`, which
+avoids the ambiguity if a checkpoint path itself ends in a number):
+
+```bash
+uv run --extra serve python -m kev_serve \
+  --run main=<clef_ckpt>@2 --run grounder=<gui_actor_ckpt>@3 --port 8008
+```
+
+Without `@N` a model uses `--device` (all of them share it). `--device` takes
+`auto` (probe, then fall back to CPU), `cpu`, `cuda` / `cuda:N`, or `mps`; `auto` picks GPU 0, so on a
+box where GPU 0 is busy name the GPU explicitly.
+
+`scripts/serve.sh <ckpt> [name] [port]` wraps the single-model case. Flags: `--host` (default
+`127.0.0.1`; use `0.0.0.0` in a container), `--port`, `--default <name>`.
 
 **Checkpoints.** `clef` is a clef-flash directory (`joint_head_config.json` + `joint_head.safetensors`
 on a Qwen3.5 VL backbone). `gui_actor` is a directory whose weights carry the vendored pointer head.

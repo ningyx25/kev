@@ -224,10 +224,17 @@ continuation, so reuse is **bit-identical to the full forward in fp32** (bf16 ro
 that runs out of device memory while states are cached drops the cache and runs once more.
 `latency_ms` is the batch's model time, and `/v1/models` carries `batches` / `prefix_cache` counters.
 
-GUI-Actor's grounding passes are batch=1 (`model.generate`), so it keeps the `SyncLockEngine`; the
-image-prefix cache for it (its prefill is dominated by image tokens) is the next step, gated on an
-M-RoPE position-continuation test. Requests a backend cannot cache are simply passed with no key —
-the engine runs them in one full pass.
+GUI-Actor's grounding passes are batch=1 (`model.generate`), so it keeps the `SyncLockEngine`.
+An image-prefix cache here (its prefill is dominated by the image tokens, and the pointer head's
+image-side input is the *embed-layer* hidden state at the image positions, cacheable alongside the
+KV) is blocked on Qwen2.5-VL's **M-RoPE continuation**: a two-stage forward — image prefix, then the
+instruction + assistant head — does not reproduce the one-pass result, because the decoder's 3D
+position ids must be recomputed for the continuation (`rope_deltas` stays at the prefix length and
+the M-RoPE `[3, B, S]` ids must be rebuilt for the joined sequence). Probed on
+`GUI-Actor-3B-Qwen2.5-VL`; a correct implementation has to replicate `get_rope_index`'s incremental
+branch, which is why it is deferred rather than shipped half-working. A single direct forward *does*
+match `generate()` bit-for-bit, so the pass itself is sound — only the two-stage split is open.
+Requests a backend cannot cache are simply passed with no key — the engine runs them in one full pass.
 
 ### Extending
 

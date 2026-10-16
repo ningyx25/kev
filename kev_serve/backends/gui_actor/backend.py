@@ -1,7 +1,16 @@
 """GuiActorBackend: serving wrapper around the vendored GUI-Actor pointer head.
 
 Images arrive decoded (PIL) in req_dict["images"]; the HTTP layer does base64 / assets handling.
-Requests run on the engine (SyncLockEngine): every grounding pass is blocking, batch=1."""
+Requests run on the engine (SyncLockEngine): every grounding pass is blocking, batch=1.
+
+No prefix cache here yet. The image prefix (system + screenshot, which dominates the prefill) and
+the pointer head's embed-layer image hidden states are both cacheable in principle, but the
+continuation does not reproduce a one-pass forward on Qwen2.5-VL: the decoder's M-RoPE 3D position
+ids must be recomputed for the joined sequence (rope_deltas stays at the prefix length), so a
+correct implementation has to replicate get_rope_index's incremental branch. A single direct forward
+does match generate() bit-for-bit — only the two-stage split is open (probed on
+GUI-Actor-3B-Qwen2.5-VL, 2026-10). This backend therefore declares no prefix_key / answer_batch and
+make_engine() keeps it on the lock engine."""
 from __future__ import annotations
 
 import os

@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "httpx"]
+test = ["pytest", "httpx", "ipykernel"]
 
 serve = [
     "requests",
@@ -34,6 +34,13 @@ vision-kernels = [
     "causal-conv1d==1.7.0",
     "flash-linear-attention==0.5.2",   # the version kev_serve/backends/clef/fused_qwen35.py is pinned to (FLA_VERSION); other versions are refused
 ]
+
+[tool.uv]
+# Build causal-conv1d against the venv's torch (2.8.0) instead of PEP 517 build isolation:
+# its build-system.requires has unpinned `torch`, which isolation resolves to the newest
+# release (2.14.1 + the whole CUDA 13 stack, GBs) and compiles against the wrong ABI.
+# Requires setuptools/torch/ninja/packaging to be present in the project venv (they are).
+no-build-isolation-package = ["causal-conv1d"]
 
 [build-system]
 requires = ["hatchling"]

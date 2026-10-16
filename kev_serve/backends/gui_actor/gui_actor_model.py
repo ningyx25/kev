@@ -514,8 +514,89 @@ def load_gui_actor_checkpoint(path: str, device: str, dtype: torch.dtype = torch
 
 
 # ── the grounding pass ────────────────────────────────────────────────────────────────────
+def build_prompt(processor, image, system_text: str, instruction: str) -> str:
+    """The click-action prompt: system turn, user turn (image + instruction), assistant head. The
+    instruction is what varies between requests over one screenshot, so the text up to and
+    including the image is stable -- that stable prefix is what the cache holds (image_prefix)."""
+    conversation = [
+        {"role": "system", "content": [{"type": "text", "text": system_text}]},
+        {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": instruction}]},
+    ]
+    text = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False, chat_template=CHAT_TEMPLATE)
+    return text + "<|im_start|>assistant<|recipient|>os\n" + format_click_action()
+
+
+def split_at_image(processor, input_ids):
+    """The index just past the image's last token: the prefix (system + user header + image) is
+    everything up to here, and the instruction + assistant head is the continuation. The pointer
+    pad lives in the continuation."""
+    ve = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    hit = (input_ids[0] == ve).nonzero(as_tuple=True)[0]
+    if hit.numel() == 0:
+        raise ValueError("no <|vision_end|> in the prompt; the chat template did not render the image")
+    return int(hit[-1].item()) + 1
+
+
 @torch.inference_mode()
-def _grounding_pass(model, processor, image, system_text: str, instruction: str):
+def image_prefix(model, processor, image, system_text: str, instruction: str):
+    """The cacheable first stage: run the prompt's image prefix (system + user header + image) once.
+
+    -> (cache, image_embeds, prefix_len, n_width, n_height, grid_thw). The pointer head's image side
+    is the *embed layer* hidden state at the image tokens; it is stable for a given (image, system
+    text), so it is cached with the KV. Continuations supply the instruction and read the pointer
+    pad's last-layer hidden state (see _grounding_pass with `prefix=`).
+
+    ``instruction`` only selects the split point (a real prompt's tokens up to <|vision_end|>); it
+    is not consumed here — the prefix prompt cannot be rebuilt with an empty instruction, because
+    that moves <|im_end|> and changes the token count. The prefix tokens are exactly the same for
+    every instruction that shares this (image, system text).
+
+    Qwen2.5-VL / Qwen3-VL / Qwen3.5 all use M-RoPE: the continuation's 3D position ids must be the
+    tail of the *joined* sequence's ids, so get_rope_index runs once over the full prompt and the
+    two stages slice it. Letting the model infer positions from a stale rope_deltas (the prefix
+    length, not the joined one) does not reproduce a one-pass forward.
+    """
+    text = build_prompt(processor, image, system_text, instruction)
+    inputs = processor(text=[text], images=[image], padding=True, return_tensors="pt").to(model.device)
+    ids = inputs["input_ids"]
+    p = split_at_image(processor, ids)
+    inner = model.model                                  # Qwen2_5_VLModel / Qwen3_VLModel / Qwen3_5Model: owns get_rope_index
+    pos3 = inner.get_rope_index(input_ids=ids, mm_token_type_ids=inputs["mm_token_type_ids"],
+                                image_grid_thw=inputs["image_grid_thw"], attention_mask=inputs.get("attention_mask"))[0]
+    out = model(input_ids=ids[:, :p], attention_mask=inputs["attention_mask"][:, :p], position_ids=pos3[:, :, :p],
+                pixel_values=inputs["pixel_values"], image_grid_thw=inputs["image_grid_thw"],
+                mm_token_type_ids=inputs["mm_token_type_ids"][:, :p], use_cache=True,
+                output_hidden_states=True, return_dict=True)
+    image_embeds = out.hidden_states[0][0][ids[0, :p] == model.config.image_token_id]
+    _, n_height, n_width = (inputs["image_grid_thw"][0] // model.model.visual.spatial_merge_size).tolist()
+    return out.past_key_values, image_embeds, p, n_width, n_height, inputs["image_grid_thw"]
+
+
+def _replicate_cache(cache):
+    """A copy of a prefix cache whose tensor state the continuation may consume: DynamicLayer.update
+    writes in place, so continuing on the stored cache would append the instruction to it and the next
+    hit would attend over a longer prefix. Shallow layer copies + cloned tensors (the layers here hold
+    keys/values tensors, unlike the hybrid backbone's dict-indexed recurrent state)."""
+    import copy as _copy
+    def cloned(v):
+        if isinstance(v, torch.Tensor): return v.clone()
+        if isinstance(v, list): return [cloned(x) for x in v]
+        if isinstance(v, tuple): return tuple(cloned(x) for x in v)
+        if isinstance(v, dict): return {k: cloned(x) for k, x in v.items()}
+        return v
+    dup = _copy.copy(cache)
+    dup.layers = []
+    for layer in cache.layers:
+        d = _copy.copy(layer)
+        for name, v in list(vars(d).items()):
+            c = cloned(v)
+            if c is not v: setattr(d, name, c)
+        dup.layers.append(d)
+    return dup
+
+
+@torch.inference_mode()
+def _grounding_pass(model, processor, image, system_text: str, instruction: str, prefix=None):
     """One placeholder-mode pass -> (attn_scores [1, n_patches], patch_logits [n_patches],
     n_width, n_height, input tokens).
 
@@ -527,32 +608,42 @@ def _grounding_pass(model, processor, image, system_text: str, instruction: str)
     triple, and nothing generated is read. The processor's inputs are passed on unfiltered:
     ``mm_token_type_ids`` is required for Qwen3.x's multimodal RoPE (raises without it) and is
     what Qwen2.5-VL's 3D position ids are computed from.
-    """
-    conversation = [
-        {"role": "system", "content": [{"type": "text", "text": system_text}]},
-        {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": instruction}]},
-    ]
-    text = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False, chat_template=CHAT_TEMPLATE)
-    text += "<|im_start|>assistant<|recipient|>os\n" + format_click_action()
-    inputs = processor(text=[text], images=[image], padding=True, return_tensors="pt").to(model.device)
-    results = model.generate(**inputs, max_new_tokens=1, return_dict_in_generate=True, output_hidden_states=True)
 
+    ``prefix`` (from image_prefix) reuses the image's KV + embed-layer hidden states and runs only
+    the instruction + assistant head; the result matches the one-pass forward to bf16 noise
+    (probed on GUI-Actor-3B-Qwen2.5-VL and the Qwen3.5-2B checkpoint).
+    """
+    text = build_prompt(processor, image, system_text, instruction)
+    inputs = processor(text=[text], images=[image], padding=True, return_tensors="pt").to(model.device)
     pointer_pad_mask = inputs["input_ids"][0] == model.config.pointer_pad_token_id
     if pointer_pad_mask.sum().item() == 0:
         raise ValueError("no <|pointer_pad|> token in the prompt; the chat template did not render the click action")
-    # query: the last layer at <|pointer_pad|>; keys: the embed layer at the image tokens
-    # (the vision features already scattered in -- the tensor the head was trained against).
-    decoder_hidden_states = results.hidden_states[0][-1][0][pointer_pad_mask]
     image_mask = inputs["input_ids"][0] == model.config.image_token_id
-    image_embeds = results.hidden_states[0][0][0][image_mask]
+
+    if prefix is None:
+        results = model.generate(**inputs, max_new_tokens=1, return_dict_in_generate=True, output_hidden_states=True)
+        decoder_hidden_states = results.hidden_states[0][-1][0][pointer_pad_mask]
+        image_embeds = results.hidden_states[0][0][0][image_mask]
+        n_tokens = int(inputs["input_ids"].shape[1])
+        _, n_height, n_width = (inputs["image_grid_thw"][0] // model.model.visual.spatial_merge_size).tolist()
+    else:
+        cache, image_embeds, p, n_width, n_height, grid_thw = prefix
+        ids = inputs["input_ids"]
+        if p > ids.shape[1]:
+            raise ValueError("the cached prefix is longer than this prompt; it does not match the image")
+        inner = model.model
+        pos3 = inner.get_rope_index(input_ids=ids, mm_token_type_ids=inputs["mm_token_type_ids"],
+                                    image_grid_thw=inputs["image_grid_thw"], attention_mask=inputs.get("attention_mask"))[0]
+        out = model(input_ids=ids[:, p:], attention_mask=inputs["attention_mask"], position_ids=pos3[:, :, p:],
+                    past_key_values=_replicate_cache(cache), use_cache=False, output_hidden_states=True, return_dict=True)
+        decoder_hidden_states = out.hidden_states[-1][0][ids[0, p:] == model.config.pointer_pad_token_id]
+        n_tokens = p + int(ids[:, p:].shape[1])
+        _, n_height, n_width = (grid_thw[0] // model.model.visual.spatial_merge_size).tolist()
+
     attn_scores, _, patch_logits = model.multi_patch_pointer_head(
         image_embeds, decoder_hidden_states, return_logits=True
     )
-
-    # image_grid_thw is in patch units; the visual tokens are merged, so divide by the merge
-    # factor. Composite layout: the tower is model.model.visual.
-    _, n_height, n_width = (inputs["image_grid_thw"][0] // model.model.visual.spatial_merge_size).tolist()
-    return attn_scores, patch_logits[0].float(), n_width, n_height, int(inputs["input_ids"].shape[1])
+    return attn_scores, patch_logits[0].float(), n_width, n_height, n_tokens
 
 
 def _to_999(x: float, y: float) -> tuple[int, int]:
@@ -587,7 +678,7 @@ def ground_answer(attn_scores, patch_logits, n_width: int, n_height: int,
 
 @torch.inference_mode()
 def systemone(model, processor, request: dict, model_type: str, topk: int = TOPK,
-              temperature: float | None = None) -> dict:
+              temperature: float | None = None, prefix=None) -> dict:
     """Answer a /v1/systemone request dict with ground answers (kev_serve adds latency_ms).
 
     The request's ``state`` is the system prompt (the checkpoints' own grounding prompt only
@@ -611,7 +702,7 @@ def systemone(model, processor, request: dict, model_type: str, topk: int = TOPK
     for qid, question in (request.get("questions") or {}).items():
         instruction = render(question.get("instructions"))
         if instruction not in passes:   # questions sharing an instruction share the pass
-            passes[instruction] = _grounding_pass(model, processor, image, system_text, instruction)
+            passes[instruction] = _grounding_pass(model, processor, image, system_text, instruction, prefix=prefix)
         attn_scores, patch_logits, n_width, n_height, n_tokens = passes[instruction]
         input_tokens += n_tokens
         answers[qid] = ground_answer(attn_scores, patch_logits, n_width, n_height, topk,

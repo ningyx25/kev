@@ -153,3 +153,64 @@ def test_fused_idempotence_and_is_fused():
         assert f.apply_fused(Text(fused=False)) is True and len(called) == 1  # eager: fused once
     finally:
         sys.modules.pop("kev_serve.backends.clef.fused_qwen35", None)
+
+
+def test_gui_actor_prefix_cache_key_and_engine():
+    """The GUI-Actor backend declares the caching hooks, so make_engine routes it to QueueBatchEngine;
+    prefix_key is (prefix token ids, n) and differs when the system text differs (same image)."""
+    import torch
+    from kev_serve.backends.gui_actor import GuiActorBackend
+    from kev_serve.engine import QueueBatchEngine
+
+    class Tok:
+        def convert_tokens_to_ids(self, t): return 9 if "vision_end" in t else 0
+    class Proc:
+        tokenizer = Tok()
+        def apply_chat_template(self, conversation, tokenize=False, **kw):
+            sys_ = conversation[0]["content"][0]["text"]
+            instr = conversation[1]["content"][1]["text"]
+            return f"system {sys_} image {instr}"
+        def __call__(self, text=None, images=None, return_tensors=None, **kw):
+            # fake encode: the system text sets the length, so a different state encodes differently
+            n = 5 + len(text[0].split("system")[1].split("image")[0]) % 7
+            return {"input_ids": torch.tensor([list(range(n))])}
+    class Model:
+        device = "cpu"
+    b = GuiActorBackend(Model(), Proc(), ".", "cpu", "qwen2_5_vl")
+    assert hasattr(b, "answer_batch_with_prefix") and hasattr(b, "prefix_key")
+
+    from kev_serve.config import Settings
+    from kev_serve.engine import make_engine
+    assert isinstance(make_engine(b, Settings()), QueueBatchEngine)     # caching backend -> model thread
+
+    # monkeypatch split_at_image so the fake encode yields a deterministic prefix
+    import kev_serve.backends.gui_actor.gui_actor_model as m
+    orig = m.split_at_image
+    m.split_at_image = lambda proc, ids: 3
+    try:
+        k1 = b.prefix_key({"images": [object()], "state": "A", "questions": {"g": {"type": "ground", "instructions": "i"}}})
+        k2 = b.prefix_key({"images": [object()], "state": "A", "questions": {"g": {"type": "ground", "instructions": "j"}}})
+        k3 = b.prefix_key({"images": [object()], "state": "B", "questions": {"g": {"type": "ground", "instructions": "i"}}})
+        assert k1 is not None and k1[1] == 3                            # (ids, n_tokens)
+        assert k1[0] == k2[0]                                          # same image+system: same prefix (instruction ignored)
+        assert b.prefix_key({"questions": {"g": {"type": "ground", "instructions": "i"}}}) is None   # no image: no cache
+    finally:
+        m.split_at_image = orig
+
+
+def test_gui_actor_replicate_cache_isolates_tensors():
+    """_replicate_cache must clone the layers' tensors: DynamicLayer.update writes in place, so a
+    continuation on the stored cache would append to it and the next hit would see a longer prefix."""
+    import torch
+    from transformers import DynamicCache
+    from kev_serve.backends.gui_actor.gui_actor_model import _replicate_cache
+
+    cache = DynamicCache()
+    k = torch.zeros(1, 2, 3, 4); v = torch.ones(1, 2, 3, 4)
+    cache.update(k, v, 0)
+    dup = _replicate_cache(cache)
+    orig_k = cache.layers[0].keys.clone()
+    # a write into the replica (what a continuation does via .update) must not touch the stored cache
+    dup.layers[0].keys += 1.0
+    assert torch.equal(cache.layers[0].keys, orig_k), "the replica shares tensors with the stored cache"
+    assert dup.layers[0] is not cache.layers[0]

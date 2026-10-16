@@ -198,8 +198,8 @@ kev_serve/
 ├── backends/       # Backend registry: base.py + one package per backend
 │   ├── clef/       #   noul / choice / score  (vendored clef-flash JointSchemaHead)
 │   └── gui_actor/  #   ground                 (vendored microsoft/GUI-Actor pointer head)
-├── engine/         # ExecutionEngine: QueueBatchEngine (continuous batching + PrefixCache + OOM retry) for
-│                   #   batch-capable backends (clef); SyncLockEngine (one locked pass) for the rest
+├── engine/         # ExecutionEngine: QueueBatchEngine (batching + PrefixCache + OOM retry) for backends
+│                   #   that declare a cache hook (clef, gui_actor); SyncLockEngine (one locked pass) for the rest
 ├── middlewares/    # telemetry / auth / images_gate; build_stack assembles them from Settings
 ├── router.py       # ModelRouter: model name -> backend (explicit / alias / default / 404)
 ├── http_app.py     # create_app(settings, router): middleware stack + the two routes
@@ -215,26 +215,31 @@ kev_serve/
 
 ### Serving engine
 
-`QueueBatchEngine` runs the batch-capable backends (today: clef). One model thread drains the queue
-into batches (up to `KEV_MAX_BATCH`) and keeps a **state-prefix cache**: the tokens up to the schema
-(system + user header + state) run once and their KV / DeltaNet states (plus the prefix hidden states
-the joint head cross-attends over) are reused by every later request over the same state — the second
-request over a state pays only for its schema. The cached prefix is deep-copied before each
-continuation, so reuse is **bit-identical to the full forward in fp32** (bf16 rounding aside); a batch
-that runs out of device memory while states are cached drops the cache and runs once more.
-`latency_ms` is the batch's model time, and `/v1/models` carries `batches` / `prefix_cache` counters.
+`QueueBatchEngine` runs both backends (either declares a cache hook; a backend that caches nothing
+goes to `SyncLockEngine`). One model thread drains the queue into batches (up to `KEV_MAX_BATCH`) and
+keeps a **prefix cache**: for clef the tokens up to the schema (system + user header + state) run once
+and their KV / DeltaNet states (plus the prefix hidden states the joint head cross-attends over) are
+reused by every later request over the same state — the second request over a state pays only for its
+schema. The cached prefix is deep-copied before each continuation, so clef reuse is **bit-identical to
+the full forward in fp32** (bf16 rounding aside); a batch that runs out of device memory while states
+are cached drops the cache and runs once more. `latency_ms` is the batch's model time, and `/v1/models`
+carries `batches` / `prefix_cache` counters.
 
-GUI-Actor's grounding passes are batch=1 (`model.generate`), so it keeps the `SyncLockEngine`.
-An image-prefix cache here (its prefill is dominated by the image tokens, and the pointer head's
-image-side input is the *embed-layer* hidden state at the image positions, cacheable alongside the
-KV) is blocked on Qwen2.5-VL's **M-RoPE continuation**: a two-stage forward — image prefix, then the
-instruction + assistant head — does not reproduce the one-pass result, because the decoder's 3D
-position ids must be recomputed for the continuation (`rope_deltas` stays at the prefix length and
-the M-RoPE `[3, B, S]` ids must be rebuilt for the joined sequence). Probed on
-`GUI-Actor-3B-Qwen2.5-VL`; a correct implementation has to replicate `get_rope_index`'s incremental
-branch, which is why it is deferred rather than shipped half-working. A single direct forward *does*
-match `generate()` bit-for-bit, so the pass itself is sound — only the two-stage split is open.
-Requests a backend cannot cache are simply passed with no key — the engine runs them in one full pass.
+GUI-Actor also caches, on the same engine. A grounding pass is batch=1 (`model.generate`), so
+collating gains nothing — but the prefill is dominated by the **image**, and only the instruction
+varies between requests. The cached unit is therefore the **image prefix** (system + user header +
+screenshot): it runs once via `image_prefix()`, and every later request over the same
+(image, system text) runs only its instruction against the cached KV. The pointer head's image side
+is the *embed-layer* hidden state at the image tokens, cached with the KV.
+
+The subtlety is **M-RoPE** (Qwen2.5-VL / Qwen3-VL / Qwen3.5 all use it): the continuation's 3D
+position ids must be the tail of the *joined* sequence's ids, not something inferred from the
+prefix's `rope_deltas`. The backend runs `get_rope_index` once over the full prompt (it is pure
+arithmetic — no forward) and slices it per stage; the cached KV is deep-copied before each
+continuation so the stored prefix is never appended to. Probed on `GUI-Actor-3B-Qwen2.5-VL` and the
+Qwen3.5-2B checkpoint: a cached answer matches the one-pass forward to bf16 noise (same argmax;
+`/tmp` probes, 2026-10). The cache key is the prefix token ids, so it encodes both the image and the
+system text. Requests a backend cannot cache are passed with no key and run in one full pass.
 
 ### Extending
 

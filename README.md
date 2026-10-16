@@ -65,13 +65,25 @@ Without `@N` a model uses `--device` (all of them share it). `--device` takes
 box where GPU 0 is busy name the GPU explicitly.
 
 `scripts/serve.sh <ckpt> [name] [port]` wraps the single-model case. Flags: `--host` (default
-`127.0.0.1`; use `0.0.0.0` in a container), `--port`, `--default <name>`.
+`127.0.0.1`; use `0.0.0.0` in a container), `--port`, `--default <name>`, `--fallback <ckpt>`
+(a checkpoint to load when a `--run` path is missing; unset = fail instead).
 
 **Checkpoints.** `clef` is a clef-flash directory (`joint_head_config.json` + `joint_head.safetensors`
 on a Qwen3.5 VL backbone). `gui_actor` is a directory whose weights carry the vendored pointer head.
+A path that does not exist and looks like `org/name[@revision]` is downloaded from the HuggingFace
+Hub first (`snapshot_download`, cached under `HF_HOME`; the card's `release_date` then comes from the
+Hub commit). A trailing `@N` is a GPU, not a revision — pin a numeric revision with `@cuda:N` free of
+ambiguity by putting the GPU on another model or using `--device`.
 
 **Env.** `KEV_API_KEY` (set = require `Authorization: Bearer <key>`; unset = open server),
-`KEV_DATE_FACTS=1` (date preprocessing on every state), `KEV_DEFAULT_MODEL`, `KEV_DEVICE_PROBE_TIMEOUT`.
+`KEV_DATE_FACTS=1` (date preprocessing on every state), `KEV_DEFAULT_MODEL`, `KEV_DEVICE_PROBE_TIMEOUT`,
+`KEV_GUI_ACTOR_TOPK`. Serving: `KEV_MAX_STATE_TOKENS` (admission limit; default = the backbone's
+window, else 65,536), `KEV_TRUNCATE_STATES=1` (read a state's first tokens instead of a 422; responses
+then carry `truncated` + `usage.state_tokens`/`state_tokens_used`), `KEV_TEMPERATURE` (calibration
+scalar: clef divides the head's logits by T; gui_actor rescales the confidence only, never the point),
+`KEV_MAX_BATCH` (64), `KEV_PREFIX_CACHE` (states kept, 4; 0 disables), `KEV_PREFIX_MIN_TOKENS`,
+`KEV_PREFIX_MAX_TOKENS` (65,536-token budget), `KEV_FUSED` (`1` insist / `0` decline / unset = auto on
+CUDA when flash-linear-attention==0.5.2 is importable; else the eager layers, silently).
 
 ### Docker
 
@@ -143,7 +155,22 @@ header (TypeSafe gates images behind it), else `422`.
 ### `GET /v1/models`
 
 One TypeSafe model card per served name (`kev-latest` / `jev-latest` alias the default):
-`kind`, `supported_primitives`, `run`, `device`, `release_date`, plus backend-specific fields.
+`kind`, `supported_primitives`, `run`, `device`, `release_date`, `temperature`, plus serving stats
+the engine keeps (`batches`, `prefix_cache` hits/misses/oom_retries) and backend-specific fields.
+
+### `POST /v1/systemone/permute` and `/v1/systemone/separate`
+
+Research endpoints over the same pipeline. `permute` re-runs one `choice` question under
+`n_perm` (1..64) shuffled option orders — `{runs: [{order, probabilities, choice, latency_ms}],
+argmax_stable, spread}` — for measuring option-order sensitivity. `separate` asks each question in
+its own pass against the same state and aggregates the answers, for the packed-vs-separate
+comparison. Both require a backend that answers `choice`.
+
+```bash
+curl localhost:8008/v1/systemone/permute -H 'content-type: application/json' -d '{
+  "request": {"model":"main","state":"…","questions":{"team":{"type":"choice","instructions":"Which team?","criteria":{"billing":"Money","sre":"Uptime"}}}},
+  "question":"team","n_perm":6,"seed":7}'
+```
 
 ### Errors & headers
 
@@ -171,7 +198,8 @@ kev_serve/
 ├── backends/       # Backend registry: base.py + one package per backend
 │   ├── clef/       #   noul / choice / score  (vendored clef-flash JointSchemaHead)
 │   └── gui_actor/  #   ground                 (vendored microsoft/GUI-Actor pointer head)
-├── engine/         # ExecutionEngine: SyncLockEngine today; a queue+batch+prefix-cache slot waits for the kev pointer head
+├── engine/         # ExecutionEngine: QueueBatchEngine (continuous batching + PrefixCache + OOM retry) for
+│                   #   batch-capable backends (clef); SyncLockEngine (one locked pass) for the rest
 ├── middlewares/    # telemetry / auth / images_gate; build_stack assembles them from Settings
 ├── router.py       # ModelRouter: model name -> backend (explicit / alias / default / 404)
 ├── http_app.py     # create_app(settings, router): middleware stack + the two routes
@@ -184,6 +212,22 @@ kev_serve/
 | --- | --- | --- |
 | `clef` | noul, choice, score | Qwen3.5 VL |
 | `gui_actor` | ground | Qwen2.5-VL (`qwen2_5_vl`, 28 px/token) · Qwen3-VL (`qwen3_vl`, `qwen3_vl_moe`, 32 px) · Qwen3.5 (`qwen3_5`, 32 px) |
+
+### Serving engine
+
+`QueueBatchEngine` runs the batch-capable backends (today: clef). One model thread drains the queue
+into batches (up to `KEV_MAX_BATCH`) and keeps a **state-prefix cache**: the tokens up to the schema
+(system + user header + state) run once and their KV / DeltaNet states (plus the prefix hidden states
+the joint head cross-attends over) are reused by every later request over the same state — the second
+request over a state pays only for its schema. The cached prefix is deep-copied before each
+continuation, so reuse is **bit-identical to the full forward in fp32** (bf16 rounding aside); a batch
+that runs out of device memory while states are cached drops the cache and runs once more.
+`latency_ms` is the batch's model time, and `/v1/models` carries `batches` / `prefix_cache` counters.
+
+GUI-Actor's grounding passes are batch=1 (`model.generate`), so it keeps the `SyncLockEngine`; the
+image-prefix cache for it (its prefill is dominated by image tokens) is the next step, gated on an
+M-RoPE position-continuation test. Requests a backend cannot cache are simply passed with no key —
+the engine runs them in one full pass.
 
 ### Extending
 
@@ -220,5 +264,7 @@ pinned by `tests/test_baseline.py`:
 
 - `kev_serve/backends/clef/clef_model.py` — clef-flash `JointSchemaHead` (Apache-2.0),
   via the `kev` monorepo. See `kev_serve/backends/clef/ATTRIBUTION.md`.
+- `kev_serve/backends/clef/fused_qwen35.py` — the fused Qwen3.5 Triton layer rewrite (Apache-2.0,
+  via `kev`), targeting flash-linear-attention at its pinned version; optional (`KEV_FUSED`).
 - `kev_serve/backends/gui_actor/gui_actor_model.py` — microsoft/GUI-Actor pointer head (MIT),
   via the `kev` monorepo. See `kev_serve/backends/gui_actor/ATTRIBUTION.md`.

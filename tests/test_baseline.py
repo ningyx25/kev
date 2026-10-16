@@ -115,9 +115,9 @@ def test_fused_helpers_without_fla():
 
     class Layers(nn.Module):
         def __init__(self): super().__init__(); self.layers = [nn.Identity()]
-    # a bare text model already has .layers
-    assert f.text_layers(Layers()).__len__() == 1
-    # the VL composite: model.language_model.layers (what _text_model() reaches for the forward too)
-    vl = Layers(); vl.language_model = Layers()
-    del vl.layers                                  # force the language_model branch
-    assert len(f.text_layers(vl)) == 1
+    # a bare text model already is the layer owner
+    assert f.text_model(Layers()).layers.__len__() == 1
+    # the VL composite: model.language_model
+    vl = nn.Module(); vl.model = Layers(); vl.model.language_model = Layers()
+    del vl.model.layers                            # force the language_model branch
+    assert f.text_model(vl).layers.__len__() == 1

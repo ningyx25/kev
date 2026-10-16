@@ -17,19 +17,19 @@ def fused_available() -> bool:
         return False
 
 
-def text_layers(vl_model):
-    """The decoder-layer list of a Qwen3.5 *VL* model: fuse() rewrites lm.layers, which for the
-    composite lives at model.language_model.layers (or model.layers on a bare-text layout)."""
-    m = vl_model.model if hasattr(vl_model, "model") and hasattr(vl_model.model, "layers") else vl_model
-    if hasattr(m, "language_model"): m = m.language_model
-    return m.layers
+def text_model(vl_model):
+    """The Qwen3.5 text backbone of a VL composite: model = {visual, language_model}, and fuse()
+    walks lm.layers — bare `vl.layers` would hit ForConditionalGeneration, which has none (the same
+    walk _text_model() in clef_model.py does)."""
+    m = getattr(vl_model, "model", vl_model)
+    return m.language_model if hasattr(m, "language_model") else m
 
 
 def apply_fused(vl_model) -> bool:
     """Rewrite the text backbone's decoder layers in place. True when fused, False when the model
     layout is not a dense Qwen3.5 stack (the MoE refusal) and eager layers were kept."""
     from .fused_qwen35 import fuse
-    fuse(text_layers(vl_model))
+    fuse(text_model(vl_model))
     return True
 
 

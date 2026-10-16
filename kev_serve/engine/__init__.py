@@ -4,9 +4,10 @@ from .prefix_cache import PrefixCache
 
 
 def make_engine(backend, settings) -> ExecutionEngine:
-    """The engine a backend runs on: QueueBatchEngine for a batch-capable one (it declares
-    answer_batch / answer_batch_with_prefix — clef does, GUI-Actor's batch=1 grounding passes do not),
-    SyncLockEngine otherwise. settings=None (library callers, tests) always takes the lock."""
+    """The engine a backend runs on: QueueBatchEngine for one that declares a cache hook
+    (answer_batch / answer_batch_with_prefix — both clef and gui_actor do), SyncLockEngine otherwise.
+    A backend with neither caches nothing and needs no model thread. settings=None (library callers,
+    tests) always takes the lock."""
     if settings is not None and (hasattr(backend, "answer_batch_with_prefix") or hasattr(backend, "answer_batch")):
         return QueueBatchEngine(backend, settings)
     return SyncLockEngine(backend)

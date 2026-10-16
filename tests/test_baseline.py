@@ -113,11 +113,43 @@ def test_fused_helpers_without_fla():
     import pytest
     pytest.importorskip  # the vendored module is only importable with fla installed; apply_fused is lazy
 
-    class Layers(nn.Module):
-        def __init__(self): super().__init__(); self.layers = [nn.Identity()]
+    class Layers:
+        def __init__(self): self.layers = [nn.Identity()]
     # a bare text model already is the layer owner
     assert f.text_model(Layers()).layers.__len__() == 1
     # the VL composite: model.language_model
     vl = nn.Module(); vl.model = Layers(); vl.model.language_model = Layers()
     del vl.model.layers                            # force the language_model branch
     assert f.text_model(vl).layers.__len__() == 1
+
+
+def test_fused_idempotence_and_is_fused():
+    """fuse() deletes `gate_proj`, so its own MoE check would misread an already-fused dense model.
+    is_fused() reports the gate_up marker and apply_fused() is a no-op on an already-fused stack —
+    the A40 clef-flash load path depends on this (fused=True, then a second apply)."""
+    from kev_serve.backends.clef import fused_layers as f
+
+    class MLP:
+        def __init__(self, fused):
+            if fused: self.gate_up = object()
+            else: self.gate_proj, self.up_proj = object(), object()
+    class Layer:
+        def __init__(self, fused): self.mlp = MLP(fused)
+    class Text:
+        def __init__(self, fused): self.layers = [Layer(fused), Layer(fused)]
+
+    assert f.is_fused(Text(fused=True)) is True
+    assert f.is_fused(Text(fused=False)) is False
+    # apply_fused on an already-fused stack returns without calling fuse() (which would re-concat gate_up)
+    called = []
+    # monkeypatch the vendored fuse so no fla/CUDA is needed
+    import sys, types
+    fake = types.ModuleType("kev_serve.backends.clef.fused_qwen35")
+    fake.fuse = lambda m: called.append(m)
+    fake.FLA_VERSION = "0.5.2"
+    sys.modules["kev_serve.backends.clef.fused_qwen35"] = fake
+    try:
+        assert f.apply_fused(Text(fused=True)) is True and called == []      # already fused: no-op
+        assert f.apply_fused(Text(fused=False)) is True and len(called) == 1  # eager: fused once
+    finally:
+        sys.modules.pop("kev_serve.backends.clef.fused_qwen35", None)

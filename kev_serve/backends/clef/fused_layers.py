@@ -26,11 +26,22 @@ def text_model(vl_model):
 
 
 def apply_fused(vl_model) -> bool:
-    """Rewrite the text backbone's decoder layers in place. True when fused, False when the model
-    layout is not a dense Qwen3.5 stack (the MoE refusal) and eager layers were kept."""
+    """Rewrite the text backbone's decoder layers in place. Idempotent: fuse() deletes `gate_proj`, so
+    its own MoE check (`all layers have gate_proj`) would misread an already-fused dense model as MoE —
+    a second call is a no-op. True when fused, raises NotImplementedError for a real MoE stack (fuse()'s
+    own refusal: those layers have neither gate_proj nor gate_up)."""
     from .fused_qwen35 import fuse
-    fuse(text_model(vl_model))
+    tm = text_model(vl_model)
+    if all(hasattr(layer.mlp, "gate_up") for layer in tm.layers):
+        return True     # already fused: fuse() cannot run again (it would re-concat gate_up)
+    fuse(tm)
     return True
+
+
+def is_fused(vl_model) -> bool:
+    """Whether the text backbone's layers already carry the fused projections."""
+    tm = text_model(vl_model)
+    return bool(tm.layers) and all(hasattr(layer.mlp, "gate_up") for layer in tm.layers)
 
 
 def fused_torch_ok() -> bool:
